@@ -1,0 +1,3 @@
+description,image_path,price,rating,category,review
+"A test product","test_image.png",99.99,4.5,"electronics","This is a test review."
+"Another test","test_image.png",12.50,3.0,"books","A different review."

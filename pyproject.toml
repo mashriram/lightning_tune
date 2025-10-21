@@ -1,0 +1,32 @@
+[project]
+readme = "README.md"
+requires-python = ">=3.12"
+name = "lightning_tune"
+version = "3.1.0"
+description = "A production-ready library for automated, advanced multi-modal LLM finetuning and deployment."
+dependencies = [
+    "polars[pyarrow]>=0.20.0",
+    "litgpt @ git+https://github.com/Lightning-AI/litgpt.git",
+    "lightning[all]",
+    "gradio",
+    "pyyaml",
+    "pydantic",
+    "timm",
+    "scikit-learn",
+    "Pillow",
+    "torchmetrics",
+    "tensorboard",
+    "torchvision",
+    "transformers",
+    "peft",
+    "trl",
+    "accelerate",
+    "bitsandbytes",
+    "datasets",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
