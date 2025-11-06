@@ -81,6 +81,7 @@ def _run_text_finetuning_pipeline(config: PipelineConfig) -> Path:
         save_strategy="epoch",
         load_best_model_at_end=config.trainer.evaluation.do_eval
         and dataset.get("test"),
+        report_to="none",
     )
 
     trainer = SFTTrainer(
@@ -197,14 +198,13 @@ def _run_multimodal_pipeline(config: PipelineConfig) -> Path:
         "cat_mappings": getattr(full_dataset, "cat_mappings", {}),
     }
     torch.save(preprocessors, best_path.parent / "preprocessors.pt")
-    print(f"--- Multi-Modal Finetuning Complete. Best model saved to: {best_path} ---")
+    logging.info(f"--- Multi-Modal Finetuning Complete. Best model saved to: {best_path} ---")
     return best_path
 
 
 def run_finetuning(config: PipelineConfig) -> Path:
     torch.set_float32_matmul_precision("high")
-    return (
-        _run_multimodal_pipeline(config)
-        if config.is_multimodal
-        else _run_text_finetuning_pipeline(config)
-    )
+    if config.is_multimodal:
+        return _run_multimodal_pipeline(config)
+    else:
+        return _run_text_finetuning_pipeline(config)

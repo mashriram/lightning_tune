@@ -35,7 +35,7 @@ class TextLLMAPI(LitAPI):
 
     @torch.inference_mode()
     def predict(self, x):
-        outputs = self.model.generate(**x, max_new_tokens=100)
+        outputs = self.model.generate(input_ids=x["input_ids"], max_new_tokens=100)
         return self.tokenizer.batch_decode(outputs, skip_special_tokens=True)[0]
 
     def encode_response(self, text) -> dict:

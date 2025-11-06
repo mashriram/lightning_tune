@@ -3,7 +3,6 @@ from pydantic import BaseModel, Field
 from typing import List, Literal, Optional, Dict
 from pathlib import Path
 import polars as pl
-from transformers import AutoConfig
 
 
 class ModelConfig(BaseModel):
@@ -171,6 +170,17 @@ class PipelineConfig(BaseModel):
             raise ValueError(f"Unsupported file type: {file_suffix}")
         return df, df.head(100)
 
+    def _get_llm_hf_config(model_repo_id: str):
+        from transformers import AutoConfig
+        return AutoConfig.from_pretrained(model_repo_id)
+
+    @classmethod
+    def from_yaml(cls, path: str) -> "PipelineConfig":
+        import yaml
+        with open(path, "r") as f:
+            config = yaml.safe_load(f)
+        return cls(**config)
+
     @classmethod
     def from_dataset(
         cls, model_repo_id: str, file_path: Path, **kwargs
@@ -198,7 +208,7 @@ class PipelineConfig(BaseModel):
             schema_analysis = cls._analyze_schema(df_sample)
         hyperparams = cls._suggest_hyperparameters(df.height)
 
-        llm_hf_config = AutoConfig.from_pretrained(model_repo_id)
+        llm_hf_config = cls._get_llm_hf_config(model_repo_id)
         data_cfg = DataConfig(
             file_path=file_path,
             text_columns=schema_analysis["text_columns"],

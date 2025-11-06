@@ -23,14 +23,7 @@ def prepare_text_dataset(config: PipelineConfig) -> DatasetDict:
     file_type = config.data.file_path.suffix.lower().replace(".", "")
     dataset = load_dataset(
         file_type, data_files=str(config.data.file_path), split="train"
-    ).map(
-        format_prompt,
-        remove_columns=list(
-            load_dataset(
-                file_type, data_files=str(config.data.file_path), split="train"
-            ).features
-        ),
-    )
+    ).map(format_prompt)
     return (
         dataset.train_test_split(test_size=config.trainer.evaluation.eval_dataset_size)
         if config.trainer.evaluation.do_eval
