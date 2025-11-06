@@ -3,7 +3,8 @@ from pathlib import Path
 
 
 def test_smart_config_creation():
-    assets_path = Path("tests/assets")
+    test_dir = Path(__file__).parent
+    assets_path = test_dir / "assets"
     config = PipelineConfig.from_dataset(
         model_repo_id="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
         file_path=assets_path / "test_multimodal.csv",

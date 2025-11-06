@@ -35,7 +35,7 @@ class TextLLMAPI(LitAPI):
 
     @torch.inference_mode()
     def predict(self, x):
-        outputs = self.model.generate(**x, max_new_tokens=100)
+        outputs = self.model.generate(input_ids=x["input_ids"], max_new_tokens=100)
         return self.tokenizer.batch_decode(outputs, skip_special_tokens=True)[0]
 
     def encode_response(self, text) -> dict:
@@ -114,6 +114,10 @@ def launch_server(config: PipelineConfig, trained_artifact_path: Path):
         api = MultiModalAPI(checkpoint_path=trained_artifact_path)
     else:
         api = TextLLMAPI(adapter_path=trained_artifact_path, config=config)
+
+    if config.trainer.device == "cuda":
+        api.model = torch.compile(api.model)
+
     server = LitServer(api, accelerator="auto", devices=1)
     print(f"\n🚀 Server launching on http://127.0.0.1:{config.deployment.port} 🚀\n")
     server.run(port=config.deployment.port)

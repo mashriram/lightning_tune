@@ -1,14 +1,32 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
 readme = "README.md"
 requires-python = ">=3.12"
 name = "lightning_tune"
 version = "3.1.0"
 description = "A production-ready library for automated, advanced multi-modal LLM finetuning and deployment."
+authors = [
+    {name = "Jules", email = "jules@example.com"},
+]
+license = {text = "Apache-2.0"}
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+]
 dependencies = [
     "polars[pyarrow]>=0.20.0",
     "litgpt @ git+https://github.com/Lightning-AI/litgpt.git",
     "lightning[all]",
+    "litserve",
     "gradio",
+    "streamlit",
+    "optuna",
+    "typer",
+    "evaluate",
     "pyyaml",
     "pydantic",
     "timm",
@@ -27,6 +45,7 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest"]
+build = ["build"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

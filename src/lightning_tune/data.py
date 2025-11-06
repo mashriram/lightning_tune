@@ -12,20 +12,18 @@ from datasets import load_dataset, DatasetDict
 
 def prepare_text_dataset(config: PipelineConfig) -> DatasetDict:
     def format_prompt(example):
+        if config.data.input_column and example.get(config.data.input_column):
+            return {
+                "text": f"### Instruction:\n{example.get(config.data.instruction_column, '')}\n\n### Input:\n{example.get(config.data.input_column, '')}\n\n### Response:\n{example.get(config.data.output_column, '')}"
+            }
         return {
-            "text": f"### Instruction:\n{example.get(config.data.instruction_column, '')}\n\n### Input:\n{example.get(config.data.input_column, '')}\n\n### Response:\n{example.get(config.data.output_column, '')}"
+            "text": f"### Instruction:\n{example.get(config.data.instruction_column, '')}\n\n### Response:\n{example.get(config.data.output_column, '')}"
         }
 
+    file_type = config.data.file_path.suffix.lower().replace(".", "")
     dataset = load_dataset(
-        "csv", data_files=str(config.data.file_path), split="train"
-    ).map(
-        format_prompt,
-        remove_columns=list(
-            load_dataset(
-                "csv", data_files=str(config.data.file_path), split="train"
-            ).features
-        ),
-    )
+        file_type, data_files=str(config.data.file_path), split="train"
+    ).map(format_prompt)
     return (
         dataset.train_test_split(test_size=config.trainer.evaluation.eval_dataset_size)
         if config.trainer.evaluation.do_eval
