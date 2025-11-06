@@ -1,4 +1,4 @@
-import lightning as L, torch, math
+import lightning as L, torch, math, warnings, logging
 from lightning.pytorch.loggers import TensorBoardLogger, CSVLogger
 from lightning.pytorch.callbacks import ModelCheckpoint
 from torch.utils.data import DataLoader
@@ -18,7 +18,13 @@ from pathlib import Path
 
 
 def _run_text_finetuning_pipeline(config: PipelineConfig) -> Path:
-    print(
+    if config.train.peft.method == "qlora" and config.trainer.device != "cuda":
+        warnings.warn(
+            "QLoRA is only available on CUDA devices. Falling back to LoRA."
+        )
+        config.train.peft.method = "lora"
+
+    logging.info(
         f"--- Starting Text-Only Finetuning with {config.train.peft.method.upper()} ---"
     )
     output_dir = config.get_output_dir()
@@ -36,8 +42,9 @@ def _run_text_finetuning_pipeline(config: PipelineConfig) -> Path:
     model = AutoModelForCausalLM.from_pretrained(
         config.model.repo_id,
         quantization_config=bnb_config,
-        device_map={"": 0},
+        device_map=config.trainer.device,
         trust_remote_code=True,
+        attn_implementation="flash_attention_2" if config.trainer.device == "cuda" else "eager",
     )
     model.config.use_cache = False
 
@@ -60,13 +67,13 @@ def _run_text_finetuning_pipeline(config: PipelineConfig) -> Path:
         num_train_epochs=config.trainer.max_epochs,
         per_device_train_batch_size=config.train.batch_size,
         gradient_accumulation_steps=1,
-        optim="paged_adamw_32bit",
+        optim="paged_adamw_32bit" if config.trainer.device == "cuda" else "adamw_torch",
         learning_rate=config.train.llm_lr,
-        bf16=(config.trainer.precision == "bf16"),
-        fp16=(config.trainer.precision == "16"),
+        bf16=(config.trainer.device == "cuda"),
+        fp16=False,
         logging_steps=10,
         do_eval=config.trainer.evaluation.do_eval,
-        evaluation_strategy=(
+        eval_strategy=(
             "epoch"
             if config.trainer.evaluation.do_eval and dataset.get("test")
             else "no"
@@ -78,30 +85,27 @@ def _run_text_finetuning_pipeline(config: PipelineConfig) -> Path:
 
     trainer = SFTTrainer(
         model=model,
-        tokenizer=tokenizer,
         train_dataset=dataset["train"],
         eval_dataset=dataset.get("test"),
         peft_config=peft_config,
-        dataset_text_field="text",
-        max_seq_length=config.data.max_seq_length,
         args=training_args,
     )
 
-    print("Starting SFTTrainer training...")
+    logging.info("Starting SFTTrainer training...")
     trainer.train()
     if config.trainer.evaluation.do_eval and dataset.get("test"):
-        print("Evaluating final model...")
+        logging.info("Evaluating final model...")
         metrics = trainer.evaluate()
-        print(f"Evaluation results: Perplexity: {math.exp(metrics['eval_loss']):.2f}")
+        logging.info(f"Evaluation results: Perplexity: {math.exp(metrics['eval_loss']):.2f}")
 
     final_adapter_path = output_dir / "final_adapter"
     trainer.save_model(str(final_adapter_path))
-    print(f"--- Finetuning Complete. Adapter saved to: {final_adapter_path} ---")
+    logging.info(f"--- Finetuning Complete. Adapter saved to: {final_adapter_path} ---")
     return final_adapter_path
 
 
 def _run_multimodal_pipeline(config: PipelineConfig) -> Path:
-    print("--- Starting Multi-Modal Finetuning ---")
+    logging.info("--- Starting Multi-Modal Finetuning ---")
     output_dir = config.get_output_dir()
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -168,10 +172,13 @@ def _run_multimodal_pipeline(config: PipelineConfig) -> Path:
         else []
     )
 
+    precision = "bf16-mixed" if config.trainer.device == "cuda" else "32-true"
+
     trainer = L.Trainer(
         max_epochs=config.trainer.max_epochs,
+        accelerator=config.trainer.device,
         devices=config.trainer.devices,
-        precision=config.trainer.precision,
+        precision=precision,
         logger=logger,
         callbacks=callbacks,
     )

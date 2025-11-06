@@ -114,6 +114,10 @@ def launch_server(config: PipelineConfig, trained_artifact_path: Path):
         api = MultiModalAPI(checkpoint_path=trained_artifact_path)
     else:
         api = TextLLMAPI(adapter_path=trained_artifact_path, config=config)
+
+    if config.trainer.device == "cuda":
+        api.model = torch.compile(api.model)
+
     server = LitServer(api, accelerator="auto", devices=1)
     print(f"\n🚀 Server launching on http://127.0.0.1:{config.deployment.port} 🚀\n")
     server.run(port=config.deployment.port)

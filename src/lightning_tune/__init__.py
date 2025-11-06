@@ -1,29 +1,18 @@
+import logging
 from .config import (
     PipelineConfig,
-    DataConfig,
     ModelConfig,
-    TrainConfig,
+    DataConfig,
     TrainerConfig,
+    TrainConfig,
+    PeftConfig,
     TabularConfig,
     VisionConfig,
-    DeploymentConfig,
-    PeftConfig,
     EvaluationConfig,
+    DeploymentConfig,
 )
 from .train import run_finetuning
 from .deploy import launch_server
 
-__all__ = [
-    "PipelineConfig",
-    "DataConfig",
-    "ModelConfig",
-    "TrainConfig",
-    "TrainerConfig",
-    "TabularConfig",
-    "VisionConfig",
-    "DeploymentConfig",
-    "PeftConfig",
-    "EvaluationConfig",
-    "run_finetuning",
-    "launch_server",
-]
+# Set up a logger for the library
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")

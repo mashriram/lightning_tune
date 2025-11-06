@@ -64,6 +64,7 @@ class MultimodalLLM(L.LightningModule):
             cache_dir=config.model.base_model_dir,
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
+            attn_implementation="flash_attention_2" if torch.cuda.is_available() else "eager",
         )
         [p.requires_grad_(False) for p in self.llm.parameters()]
         self.vision_tower = (
@@ -76,17 +77,20 @@ class MultimodalLLM(L.LightningModule):
             if config.data.tabular_config
             else None
         )
+        self.to(self.llm.dtype)
 
     def forward(self, batch):
         text_embeds = self.llm.get_input_embeddings()(batch["input_ids"])
         prefix_embeds, num_prefix_tokens = [], 0
         if self.vision_tower and "image" in batch:
-            prefix_embeds.append(self.vision_tower(batch["image"]))
+            prefix_embeds.append(self.vision_tower(batch["image"].to(self.llm.dtype)))
             num_prefix_tokens += 1
         if self.tabular_tower and ("tabular_cat" in batch or "tabular_num" in batch):
-            tab_embed = self.tabular_tower(
-                batch.get("tabular_cat"), batch.get("tabular_num")
-            )
+            tabular_cat = batch.get("tabular_cat")
+            tabular_num = batch.get("tabular_num")
+            if tabular_num is not None:
+                tabular_num = tabular_num.to(self.llm.dtype)
+            tab_embed = self.tabular_tower(tabular_cat, tabular_num)
             if tab_embed is not None:
                 prefix_embeds.append(tab_embed)
                 num_prefix_tokens += 1

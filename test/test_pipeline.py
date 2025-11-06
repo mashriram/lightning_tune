@@ -18,10 +18,11 @@ def test_e2e_text_pipeline(tmp_path):
 
 @pytest.mark.slow
 def test_e2e_multimodal_pipeline(tmp_path):
+    test_dir = Path(__file__).parent
     config = lt.PipelineConfig.from_dataset(
         model_repo_id="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-        file_path=Path("tests/assets/test_multimodal.csv"),
-        image_root_path=Path("tests/assets"),
+        file_path=test_dir / "assets/test_multimodal.csv",
+        image_root_path=test_dir / "assets",
     )
     config.trainer.max_epochs = 1
     config.train.batch_size = 1
