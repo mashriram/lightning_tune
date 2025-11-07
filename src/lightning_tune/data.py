@@ -35,7 +35,29 @@ def prepare_text_dataset(config: PipelineConfig) -> DatasetDict:
 class MultiModalDataset(Dataset):
     def __init__(self, config: PipelineConfig, tokenizer: AutoTokenizer):
         self.config, self.tokenizer = config.data, tokenizer
-        self.df = pl.read_csv(self.config.file_path)
+        file_suffix = self.config.file_path.suffix.lower()
+        if file_suffix == ".csv":
+            df = pl.read_csv(self.config.file_path)
+        elif file_suffix in (".json", ".jsonl"):
+            df = pl.read_json(self.config.file_path)
+        else:
+            raise ValueError(f"Unsupported file type: {file_suffix}")
+
+        if self.config.vision_config and self.config.image_root_path:
+            image_column = self.config.vision_config.image_column
+            image_root_path = self.config.image_root_path
+            self.df = df.filter(
+                pl.col(image_column).map_elements(lambda x: (image_root_path / x).exists())
+            )
+            if len(self.df) == 0:
+                raise ValueError(
+                    "After filtering for valid images, the dataset is empty. "
+                    "Please ensure the image paths in your data file are correct "
+                    "and the `image_root_path` is set correctly."
+                )
+        else:
+            self.df = df
+
         self._setup_preprocessors()
         self._setup_image_transforms()
 
@@ -72,9 +94,13 @@ class MultiModalDataset(Dataset):
 
     def __getitem__(self, i: int) -> Dict:
         row = self.df.row(i, named=True)
-        text, target = " ".join(str(row[c]) for c in self.config.text_columns), str(
-            row[self.config.output_column]
-        )
+        if self.config.text_columns:
+            text = " ".join(str(row[c]) for c in self.config.text_columns)
+        else:
+            text = row[self.config.instruction_column]
+            if self.config.input_column in row and row[self.config.input_column]:
+                text += "\n" + row[self.config.input_column]
+        target = str(row[self.config.output_column])
         source, target_toks = self.tokenizer.encode(text), self.tokenizer.encode(target)
         input_ids, labels = source + target_toks, torch.full(
             (len(source) + len(target_toks),), -100
@@ -84,11 +110,13 @@ class MultiModalDataset(Dataset):
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
             "labels": labels,
         }
-        if self.config.vision_config and self.config.image_root_path:
+        if self.config.vision_config and self.config.image_root_path and self.config.vision_config.image_column in row and row[self.config.vision_config.image_column]:
             img_p = (
                 self.config.image_root_path
                 / row[self.config.vision_config.image_column]
             )
+            if img_p.exists():
+                item["image"] = self.image_transform(Image.open(img_p).convert("RGB"))
             # <-- ADDED ROBUSTNESS CHECK -->
             try:
                 item["image"] = self.image_transform(Image.open(img_p).convert("RGB"))

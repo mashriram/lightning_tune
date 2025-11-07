@@ -2,6 +2,7 @@ import optuna
 from .config import PipelineConfig
 from .train import run_finetuning
 
+import json
 def _objective(trial, config: PipelineConfig):
     # Define the search space for the hyperparameters
     config.train.llm_lr = trial.suggest_float("llm_lr", 1e-6, 1e-4, log=True)
@@ -9,16 +10,15 @@ def _objective(trial, config: PipelineConfig):
     config.train.peft.lora_alpha = trial.suggest_int("lora_alpha", 8, 64, step=8)
 
     # Run the finetuning process
-    trainer = run_finetuning(config)
+    run_finetuning(config, trial)
 
     # Return the validation loss
-    if hasattr(trainer, "state") and hasattr(trainer.state, "best_metric"):
-        return trainer.state.best_metric
-    else:
-        # If the trainer does not have a state attribute, it means that the
-        # training was not successful. In this case, we return a large value
-        # to indicate that this trial should be pruned.
-        return float("inf")
+    metrics_path = config.get_output_dir() / "metrics.json"
+    if metrics_path.exists():
+        with open(metrics_path, "r") as f:
+            metrics = json.load(f)
+        return metrics.get("eval_loss", float("inf"))
+    return float("inf")
 
 def run_hyperparameter_tuning(config: PipelineConfig, n_trials: int = 10):
     study = optuna.create_study(direction="minimize")

@@ -17,7 +17,8 @@ from trl import SFTTrainer
 from pathlib import Path
 
 
-def _run_text_finetuning_pipeline(config: PipelineConfig) -> Path:
+import json
+def _run_text_finetuning_pipeline(config: PipelineConfig, trial) -> Path:
     if config.train.peft.method == "qlora" and config.trainer.device != "cuda":
         warnings.warn(
             "QLoRA is only available on CUDA devices. Falling back to LoRA."
@@ -98,6 +99,9 @@ def _run_text_finetuning_pipeline(config: PipelineConfig) -> Path:
         logging.info("Evaluating final model...")
         metrics = trainer.evaluate()
         logging.info(f"Evaluation results: Perplexity: {math.exp(metrics['eval_loss']):.2f}")
+        if trial:
+            with open(output_dir / "metrics.json", "w") as f:
+                json.dump(metrics, f)
 
     final_adapter_path = output_dir / "final_adapter"
     trainer.save_model(str(final_adapter_path))
@@ -105,7 +109,7 @@ def _run_text_finetuning_pipeline(config: PipelineConfig) -> Path:
     return final_adapter_path
 
 
-def _run_multimodal_pipeline(config: PipelineConfig) -> Path:
+def _run_multimodal_pipeline(config: PipelineConfig, trial) -> Path:
     logging.info("--- Starting Multi-Modal Finetuning ---")
     output_dir = config.get_output_dir()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -193,6 +197,11 @@ def _run_multimodal_pipeline(config: PipelineConfig) -> Path:
     if not best_path.exists():
         trainer.save_checkpoint(str(best_path))
 
+    if trial:
+        metrics = trainer.callback_metrics
+        with open(output_dir / "metrics.json", "w") as f:
+            json.dump({k: v.item() for k, v in metrics.items()}, f)
+
     preprocessors = {
         "scaler": getattr(full_dataset, "scaler", None),
         "cat_mappings": getattr(full_dataset, "cat_mappings", {}),
@@ -202,9 +211,9 @@ def _run_multimodal_pipeline(config: PipelineConfig) -> Path:
     return best_path
 
 
-def run_finetuning(config: PipelineConfig) -> Path:
+def run_finetuning(config: PipelineConfig, trial = None) -> Path:
     torch.set_float32_matmul_precision("high")
     if config.is_multimodal:
-        return _run_multimodal_pipeline(config)
+        return _run_multimodal_pipeline(config, trial)
     else:
-        return _run_text_finetuning_pipeline(config)
+        return _run_text_finetuning_pipeline(config, trial)

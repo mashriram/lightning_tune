@@ -1,4 +1,4 @@
-import torch, torch.nn as nn, lightning as L, timm, torchmetrics
+import torch, torch.nn as nn, lightning as L, timm, torchmetrics, warnings
 from transformers import AutoModelForCausalLM
 from .config import PipelineConfig, TabularConfig, VisionConfig
 
@@ -43,9 +43,15 @@ class TabularTower(nn.Module):
 class VisionTower(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
-        self.vision_model = timm.create_model(
-            config.model_name, pretrained=True, num_classes=0
-        )
+        try:
+            self.vision_model = timm.create_model(
+                config.model_name, pretrained=True, num_classes=0
+            )
+        except RuntimeError:
+            warnings.warn(f"Could not load pretrained weights for {config.model_name}. Using random initialization.")
+            self.vision_model = timm.create_model(
+                config.model_name, pretrained=False, num_classes=0
+            )
         self.projection = nn.Linear(
             self.vision_model.num_features, config.projection_dim
         )

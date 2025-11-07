@@ -55,6 +55,11 @@ if st.session_state.config:
             config.data.vision_config.image_column = st.text_input(
                 "Image Column", config.data.vision_config.image_column
             )
+            config.data.vision_config.model_name = st.selectbox(
+                "Vision Encoder",
+                ["vit_base_patch16_224", "vit_large_patch14_224", "vit_huge_patch14_224"],
+                index=["vit_base_patch16_224", "vit_large_patch14_224", "vit_huge_patch14_224"].index(config.data.vision_config.model_name),
+            )
         if config.data.tabular_config:
             config.data.tabular_config.numerical_columns = st.text_input(
                 "Numerical Columns", ", ".join(config.data.tabular_config.numerical_columns)

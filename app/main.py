@@ -57,7 +57,7 @@ def analyze_dataset(model_id, dataset_file):
 
 
 def start_finetuning_ui(
-    config, v_col, n_cols, c_cols, t_cols, target_col, peft, r, alpha, lr, epochs
+    config, v_col, vision_encoder, n_cols, c_cols, t_cols, target_col, peft, r, alpha, lr, epochs
 ):
     if not isinstance(config, lt.PipelineConfig):
         raise gr.Error("Analyze a dataset first by going back to the 'Setup' tab.")
@@ -65,6 +65,7 @@ def start_finetuning_ui(
     # Update config with user's choices from the UI
     if config.data.vision_config:
         config.data.vision_config.image_column = v_col
+        config.data.vision_config.model_name = vision_encoder
     if config.data.tabular_config:
         config.data.tabular_config.numerical_columns = [
             c.strip() for c in n_cols.split(",") if c.strip()
@@ -111,6 +112,11 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
             gr.Markdown("🔬 **Smart Analysis Results** (Edit if needed)")
             with gr.Accordion("Data Configuration", open=True):
                 vis_col_out = gr.Textbox(label="Image Column")
+                vision_encoder_in = gr.Dropdown(
+                    label="Vision Encoder",
+                    choices=["vit_base_patch16_224", "vit_large_patch14_224", "vit_huge_patch14_224"],
+                    value="vit_base_patch16_224",
+                )
                 num_cols_out = gr.Textbox(label="Numerical Columns (comma-separated)")
                 cat_cols_out = gr.Textbox(label="Categorical Columns (comma-separated)")
                 txt_cols_out = gr.Textbox(
@@ -183,6 +189,7 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
         inputs=[
             config_state,
             vis_col_out,
+            vision_encoder_in,
             num_cols_out,
             cat_cols_out,
             txt_cols_out,
