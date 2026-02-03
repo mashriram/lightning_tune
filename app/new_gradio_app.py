@@ -34,15 +34,34 @@ def search_datasets_api(query, token):
     except:
         return []
 
-def analyze_api(model, dataset, token, split=None):
+def upload_file_api(file_obj):
+    if not file_obj:
+        return None
+    try:
+        files = {"file": open(file_obj.name, "rb")}
+        resp = requests.post(f"{API_URL}/upload", files=files)
+        if resp.status_code == 200:
+            return resp.json()["file_path"]
+        return None
+    except:
+        return None
+
+def analyze_api(model, dataset, file_path, token, split=None):
     headers = {"Authorization": f"Bearer {token}"} if token else {}
-    payload = {"model_repo_id": model, "dataset_repo_id": dataset, "split": split}
+    # Prioritize file if present
+    payload = {"model_repo_id": model, "split": split}
+    if file_path:
+        payload["file_path"] = file_path
+    elif dataset:
+        payload["dataset_repo_id"] = dataset
+    else:
+        return {"msg": "Please select a dataset or upload a file.", "needs_split": False}
+
     try:
         resp = requests.post(f"{API_URL}/analyze", json=payload, headers=headers)
         if resp.status_code == 200:
             data = resp.json()
             if "status" in data and data["status"] == "split_selection_needed":
-                # Show splits
                 return {
                     "raw": data,
                     "msg": data["message"],
@@ -50,7 +69,6 @@ def analyze_api(model, dataset, token, split=None):
                     "needs_split": True
                 }
             else:
-                # Success config
                 return {
                     "raw": data,
                     "msg": "Analysis Successful!",
@@ -107,20 +125,37 @@ with gr.Blocks(title="Lightning Tune Pro") as app:
             model_search.change(search_models_api, inputs=[model_search, hf_token], outputs=model_dd)
 
         with gr.Row():
-            data_search = gr.Textbox(label="Search Dataset")
-            data_dd = gr.Dropdown(label="Select Dataset")
-            data_search.change(search_datasets_api, inputs=[data_search, hf_token], outputs=data_dd)
+            with gr.Column():
+                gr.Markdown("### Option A: Hugging Face Dataset")
+                data_search = gr.Textbox(label="Search Dataset")
+                data_dd = gr.Dropdown(label="Select Dataset")
+                data_search.change(search_datasets_api, inputs=[data_search, hf_token], outputs=data_dd)
+            with gr.Column():
+                gr.Markdown("### Option B: Upload File")
+                file_in = gr.File(label="Upload CSV/JSON")
 
-        analyze_btn = gr.Button("Analyze")
+        analyze_btn = gr.Button("Analyze", variant="primary")
         split_dd = gr.Dropdown(label="Select Split", visible=False)
         analysis_status = gr.Textbox(label="Status", interactive=False)
         json_config = gr.JSON(label="Generated Config", visible=True)
 
-        # Internal state for config
+        # Internal states
         final_config = gr.State()
+        uploaded_path = gr.State()
 
-        def do_analyze(mod, dat, tok, spl=None):
-            res = analyze_api(mod, dat, tok, spl)
+        # Handle file upload automatically when file changes
+        def handle_upload(f):
+            if f:
+                path = upload_file_api(f)
+                return path
+            return None
+
+        file_in.upload(handle_upload, inputs=[file_in], outputs=[uploaded_path])
+
+        def do_analyze(mod, dat, up_path, tok, spl=None):
+            # Pass uploaded path if exists, otherwise dataset
+            # If both, logic in analyze_api prioritizes file
+            res = analyze_api(mod, dat, up_path, tok, spl)
             if res.get("needs_split"):
                 return {
                     analysis_status: res["msg"],
@@ -136,7 +171,7 @@ with gr.Blocks(title="Lightning Tune Pro") as app:
                     json_config: res.get("raw")
                 }
 
-        analyze_btn.click(do_analyze, inputs=[model_dd, data_dd, hf_token, split_dd],
+        analyze_btn.click(do_analyze, inputs=[model_dd, data_dd, uploaded_path, hf_token, split_dd],
                           outputs=[analysis_status, split_dd, final_config, json_config])
 
     with gr.Tab("2. Train"):
@@ -160,8 +195,6 @@ with gr.Blocks(title="Lightning Tune Pro") as app:
         train_btn.click(start_training_wrapper, inputs=[final_config, push_check, hub_model_id, hf_token],
                         outputs=[job_id_display, logs_box])
 
-        # Log streaming (client side JS or polling? Native websocket in Gradio is tricky.
-        # We can implement a generator that connects to WS)
         async def stream_logs_gen(jid):
             if not jid or "Failed" in jid:
                 yield "No job."
@@ -200,7 +233,6 @@ with gr.Blocks(title="Lightning Tune Pro") as app:
             if not url:
                 return history + [[message, "Server not connected."]]
             try:
-                # LitServe standard request: {"prompt": ...}
                 resp = requests.post(f"{url}/predict", json={"prompt": message})
                 if resp.status_code == 200:
                     reply = resp.json().get("completion", "No response")
@@ -217,4 +249,4 @@ with gr.Blocks(title="Lightning Tune Pro") as app:
         clear.click(lambda: None, None, chatbot, queue=False)
 
 if __name__ == "__main__":
-    app.launch(server_port=7860) # Different port than backend
+    app.launch(server_port=7860)

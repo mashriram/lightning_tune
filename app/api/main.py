@@ -1,5 +1,8 @@
-from fastapi import FastAPI, HTTPException, Header, Depends, WebSocket
+from fastapi import FastAPI, HTTPException, Header, Depends, WebSocket, UploadFile, File
 from typing import List, Optional, Union, Dict, Any
+from pathlib import Path
+import shutil
+import uuid
 from .schemas import SearchResult, DatasetSearchResult, AnalyzeRequest, TrainRequest, JobResponse, ServeRequest, PushRequest
 from .job_manager import job_manager
 from src.lightning_tune.hf_utils import search_models, search_datasets
@@ -10,6 +13,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("api")
 
 app = FastAPI(title="Lightning Tune API")
+
+UPLOAD_DIR = Path("temp_uploads")
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 def get_token(authorization: Optional[str] = Header(None)) -> Optional[str]:
     if authorization:
@@ -36,20 +42,57 @@ def find_datasets(query: str, limit: int = 20, token: Optional[str] = Depends(ge
         logger.error(f"Search datasets failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/upload")
+async def upload_file(file: UploadFile = File(...)):
+    """
+    Upload a dataset file (CSV/JSON).
+    """
+    try:
+        file_ext = Path(file.filename).suffix
+        file_id = str(uuid.uuid4())
+        file_path = UPLOAD_DIR / f"{file_id}{file_ext}"
+
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        return {"file_path": str(file_path.absolute())}
+    except Exception as e:
+        logger.error(f"Upload failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/analyze")
 def analyze_dataset(request: AnalyzeRequest, token: Optional[str] = Depends(get_token)):
     """
-    Analyze a HF dataset and suggest configuration.
+    Analyze a HF dataset or uploaded file and suggest configuration.
     """
     try:
+        # Check if file path or repo id
+        kwargs = {}
+        if request.file_path:
+            kwargs["file_path"] = Path(request.file_path)
+            # If file path implies multimodal (images in zip?), usually handled by user ensuring paths are relative?
+            # Or simplified: we assume images are not uploaded via single file endpoint easily for now unless zip.
+            # But PipelineConfig usually expects a csv pointing to images on disk.
+            # For simplicity in this demo API, we treat upload as the data file.
+            # Image root path might be an issue if images are separate.
+            # We assume user uploads self-contained or text-only if single file.
+            # If zip, we could extract.
+            # For now, pass file_path.
+            if request.file_path.endswith(".zip"):
+                 # Optional: Unzip logic?
+                 pass
+        elif request.dataset_repo_id:
+            kwargs["dataset_repo_id"] = request.dataset_repo_id
+            kwargs["split"] = request.split
+        else:
+            raise HTTPException(status_code=400, detail="Provide either dataset_repo_id or file_path")
+
         result = PipelineConfig.from_dataset(
             model_repo_id=request.model_repo_id,
-            dataset_repo_id=request.dataset_repo_id,
-            split=request.split,
-            token=token
+            token=token,
+            **kwargs
         )
         if isinstance(result, dict):
-             # This means split selection is needed or some other info
              return result
         return result.model_dump()
     except Exception as e:
