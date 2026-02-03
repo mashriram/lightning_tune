@@ -7,6 +7,7 @@ from PIL import Image
 from torchvision import transforms
 from sklearn.preprocessing import StandardScaler
 from .config import PipelineConfig
+from .hf_utils import get_dataset_splits
 from datasets import load_dataset, DatasetDict
 import io
 import requests
@@ -28,33 +29,26 @@ def prepare_text_dataset(config: PipelineConfig) -> DatasetDict:
         dataset = dataset.map(format_prompt)
 
         if config.trainer.evaluation.do_eval:
-            # Try to find a validation or test split
-            eval_split = None
+            # Check available splits
             try:
-                # We can't easily check available splits in streaming mode without inspection,
-                # but we can try-catch loading 'test' or 'validation'
-                # For simplicity, we'll assume 'test' or 'validation' exists if user wants eval,
-                # or we just rely on the user to have provided a split name if they wanted specific split.
-                # But here we are looking for a separate eval split.
+                available_splits = get_dataset_splits(config.data.dataset_repo_id)
+                eval_split = None
+                for split in ["test", "validation"]:
+                    if split in available_splits:
+                        eval_split = split
+                        break
 
-                # Let's try 'test', then 'validation'
-                for split_name in ["test", "validation"]:
-                    try:
-                        eval_dataset = load_dataset(config.data.dataset_repo_id, split=split_name, streaming=True)
-                        # If successful, use it
-                        eval_dataset = eval_dataset.map(format_prompt)
-                        logging.info(f"Using '{split_name}' split for evaluation.")
-                        return DatasetDict({"train": dataset, "test": eval_dataset})
-                    except:
-                        continue
-
-                # If we are here, we didn't find a split.
-                # We can simulate a split by taking/skipping if needed, but for now just warn.
-                warnings.warn("Could not find 'test' or 'validation' split for streaming dataset. Evaluation disabled.")
-                return DatasetDict({"train": dataset})
+                if eval_split:
+                    logging.info(f"Using '{eval_split}' split for evaluation.")
+                    eval_dataset = load_dataset(config.data.dataset_repo_id, split=eval_split, streaming=True)
+                    eval_dataset = eval_dataset.map(format_prompt)
+                    return DatasetDict({"train": dataset, "test": eval_dataset})
+                else:
+                    warnings.warn("Could not find 'test' or 'validation' split. Evaluation disabled.")
+                    return DatasetDict({"train": dataset})
 
             except Exception as e:
-                warnings.warn(f"Error setting up evaluation for streaming dataset: {e}")
+                warnings.warn(f"Error checking splits: {e}. Evaluation disabled.")
                 return DatasetDict({"train": dataset})
 
         return DatasetDict({"train": dataset})

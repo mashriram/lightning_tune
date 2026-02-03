@@ -6,6 +6,7 @@ from functools import partial
 from .config import PipelineConfig
 from .data import prepare_text_dataset, MultiModalDataset, StreamingMultiModalDataset, multimodal_collate_fn
 from .model import MultimodalLLM
+from .hf_utils import get_dataset_splits
 from transformers import (
     AutoModelForCausalLM,
     AutoModelForVision2Seq,
@@ -42,11 +43,6 @@ def _run_text_finetuning_pipeline(config: PipelineConfig) -> Path:
         if config.train.peft.method == "qlora"
         else None
     )
-
-    # Check if native multimodal model (e.g. Llava) used in text pipeline (unlikely but possible if captioning)
-    # Actually, SFTTrainer supports standard causal LM. If it's a VLM used as text generator, it might need AutoModelForVision2Seq.
-    # But for now assuming text-only pipeline uses AutoModelForCausalLM is safe for pure text tasks.
-    # If user wants to fine-tune VLM on images, they go to multimodal pipeline.
 
     model = AutoModelForCausalLM.from_pretrained(
         config.model.repo_id,
@@ -134,16 +130,23 @@ def _run_multimodal_pipeline(config: PipelineConfig) -> Path:
         train_dataset = StreamingMultiModalDataset(config, tokenizer)
         val_dataset = None
         if config.trainer.evaluation.do_eval:
-             val_config = copy.deepcopy(config)
-             for split in ["test", "validation"]:
-                 try:
-                     val_config.data.split = split
-                     # This check assumes loading doesn't fail immediately but iteration would.
-                     # We trust user or luck here.
+             try:
+                 available_splits = get_dataset_splits(config.data.dataset_repo_id)
+                 eval_split = None
+                 for split in ["test", "validation"]:
+                     if split in available_splits:
+                         eval_split = split
+                         break
+
+                 if eval_split:
+                     val_config = copy.deepcopy(config)
+                     val_config.data.split = eval_split
                      val_dataset = StreamingMultiModalDataset(val_config, tokenizer)
-                     break
-                 except Exception:
-                     continue
+                 else:
+                     warnings.warn("Could not find 'test' or 'validation' split. Evaluation disabled.")
+
+             except Exception as e:
+                 warnings.warn(f"Error checking splits: {e}. Evaluation disabled.")
 
         train_loader = DataLoader(
             train_dataset,
@@ -205,15 +208,7 @@ def _run_multimodal_pipeline(config: PipelineConfig) -> Path:
     hf_config = AutoConfig.from_pretrained(config.model.repo_id, trust_remote_code=True)
     is_native_vlm = hasattr(hf_config, "vision_config") and hf_config.vision_config is not None
 
-    # If native VLM, we should ideally use a Lightning Module that wraps it without adding extra towers.
-    # Our MultimodalLLM adds an extra tower.
-    # For this task, we will modify MultimodalLLM to handle this case internally or here.
-    # To keep it robust, let's pass a flag to MultimodalLLM.
-
-    # NOTE: MultimodalLLM constructor takes config.
-    # We can rely on MultimodalLLM detecting it if we move logic there, OR we update MultimodalLLM now.
-
-    model = MultimodalLLM(config) # MultimodalLLM will be updated to handle native VLMs
+    model = MultimodalLLM(config)
 
     logger = (
         TensorBoardLogger("logs", name=output_dir.name)

@@ -1,5 +1,6 @@
 import torch, torch.nn as nn, lightning as L, timm, torchmetrics
 from transformers import AutoModelForCausalLM, AutoModelForVision2Seq, AutoConfig
+from peft import get_peft_model, LoraConfig, TaskType
 from .config import PipelineConfig, TabularConfig, VisionConfig
 import logging
 
@@ -105,7 +106,6 @@ class MultimodalLLM(L.LightningModule):
         # If native VLM, we should apply PEFT (LoRA) immediately since we froze everything.
         # Otherwise we have no trainable params.
         if self.is_native_vlm:
-             from peft import get_peft_model, LoraConfig, TaskType
              # Map our PeftConfig to Peft LoraConfig
              peft_cfg = LoraConfig(
                  r=config.train.peft.r,
