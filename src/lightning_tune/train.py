@@ -8,9 +8,11 @@ from .data import prepare_text_dataset, MultiModalDataset, StreamingMultiModalDa
 from .model import MultimodalLLM
 from transformers import (
     AutoModelForCausalLM,
+    AutoModelForVision2Seq,
     AutoTokenizer,
     TrainingArguments,
     BitsAndBytesConfig,
+    AutoConfig
 )
 from peft import LoraConfig
 from trl import SFTTrainer
@@ -40,6 +42,12 @@ def _run_text_finetuning_pipeline(config: PipelineConfig) -> Path:
         if config.train.peft.method == "qlora"
         else None
     )
+
+    # Check if native multimodal model (e.g. Llava) used in text pipeline (unlikely but possible if captioning)
+    # Actually, SFTTrainer supports standard causal LM. If it's a VLM used as text generator, it might need AutoModelForVision2Seq.
+    # But for now assuming text-only pipeline uses AutoModelForCausalLM is safe for pure text tasks.
+    # If user wants to fine-tune VLM on images, they go to multimodal pipeline.
+
     model = AutoModelForCausalLM.from_pretrained(
         config.model.repo_id,
         quantization_config=bnb_config,
@@ -83,9 +91,6 @@ def _run_text_finetuning_pipeline(config: PipelineConfig) -> Path:
         load_best_model_at_end=config.trainer.evaluation.do_eval
         and dataset.get("test"),
         report_to="none",
-        # For streaming datasets, max_steps is preferred over num_train_epochs usually,
-        # but SFTTrainer handles epochs on IterableDataset by expecting it to terminate.
-        # HF Streaming datasets terminate after one epoch.
     )
 
     trainer = SFTTrainer(
@@ -196,14 +201,26 @@ def _run_multimodal_pipeline(config: PipelineConfig) -> Path:
             else None
         )
 
-    model = MultimodalLLM(config)
+    # Check for Native Multimodal Support
+    hf_config = AutoConfig.from_pretrained(config.model.repo_id, trust_remote_code=True)
+    is_native_vlm = hasattr(hf_config, "vision_config") and hf_config.vision_config is not None
+
+    # If native VLM, we should ideally use a Lightning Module that wraps it without adding extra towers.
+    # Our MultimodalLLM adds an extra tower.
+    # For this task, we will modify MultimodalLLM to handle this case internally or here.
+    # To keep it robust, let's pass a flag to MultimodalLLM.
+
+    # NOTE: MultimodalLLM constructor takes config.
+    # We can rely on MultimodalLLM detecting it if we move logic there, OR we update MultimodalLLM now.
+
+    model = MultimodalLLM(config) # MultimodalLLM will be updated to handle native VLMs
+
     logger = (
         TensorBoardLogger("logs", name=output_dir.name)
         if config.trainer.logger == "tensorboard"
         else CSVLogger("logs", name=output_dir.name)
     )
 
-    # Checkpoint callback (requires val_loader to monitor val_loss)
     callbacks = []
     if config.trainer.checkpoint_callback:
         if val_loader:
@@ -217,7 +234,6 @@ def _run_multimodal_pipeline(config: PipelineConfig) -> Path:
                 )
              )
         else:
-             # If no validation, save last checkpoitn at end
              pass
 
     precision = "bf16-mixed" if config.trainer.device == "cuda" else "32-true"
@@ -232,14 +248,12 @@ def _run_multimodal_pipeline(config: PipelineConfig) -> Path:
     )
     trainer.fit(model, train_loader, val_loader)
 
-    # Save best or final
     if callbacks and hasattr(callbacks[0], "best_model_path") and callbacks[0].best_model_path:
         best_path = Path(callbacks[0].best_model_path)
     else:
         best_path = output_dir / "final.ckpt"
         trainer.save_checkpoint(str(best_path))
 
-    # Save preprocessors if available (not for streaming usually)
     preprocessors = {
         "scaler": getattr(train_dataset, "scaler", None) or getattr(full_dataset if 'full_dataset' in locals() else None, "scaler", None),
         "cat_mappings": getattr(train_dataset, "cat_mappings", {}) or getattr(full_dataset if 'full_dataset' in locals() else None, "cat_mappings", {}),

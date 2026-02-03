@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException, Header, Depends, WebSocket
-from typing import List, Optional
+from typing import List, Optional, Union, Dict, Any
 from .schemas import SearchResult, DatasetSearchResult, AnalyzeRequest, TrainRequest, JobResponse, ServeRequest
 from .job_manager import job_manager
 from src.lightning_tune.hf_utils import search_models, search_datasets
@@ -42,12 +42,16 @@ def analyze_dataset(request: AnalyzeRequest, token: Optional[str] = Depends(get_
     Analyze a HF dataset and suggest configuration.
     """
     try:
-        config = PipelineConfig.from_dataset(
+        result = PipelineConfig.from_dataset(
             model_repo_id=request.model_repo_id,
             dataset_repo_id=request.dataset_repo_id,
+            split=request.split,
             token=token
         )
-        return config.model_dump()
+        if isinstance(result, dict):
+             # This means split selection is needed or some other info
+             return result
+        return result.model_dump()
     except Exception as e:
         logger.error(f"Analysis failed: {e}")
         msg = str(e)

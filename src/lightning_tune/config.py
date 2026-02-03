@@ -1,8 +1,9 @@
 import logging, warnings
 from pydantic import BaseModel, Field, model_validator
-from typing import List, Literal, Optional, Dict, Any
+from typing import List, Literal, Optional, Dict, Any, Union
 from pathlib import Path
 import polars as pl
+from .hf_utils import get_dataset_splits
 
 
 class ModelConfig(BaseModel):
@@ -181,7 +182,7 @@ class PipelineConfig(BaseModel):
 
     def _get_llm_hf_config(model_repo_id: str):
         from transformers import AutoConfig
-        return AutoConfig.from_pretrained(model_repo_id)
+        return AutoConfig.from_pretrained(model_repo_id, trust_remote_code=True)
 
     @classmethod
     def from_yaml(cls, path: str) -> "PipelineConfig":
@@ -196,8 +197,9 @@ class PipelineConfig(BaseModel):
         model_repo_id: str,
         file_path: Optional[Path] = None,
         dataset_repo_id: Optional[str] = None,
+        split: Optional[str] = None,
         **kwargs
-    ) -> "PipelineConfig":
+    ) -> Union["PipelineConfig", Dict[str, Any]]:
         logging.info(f"🔬 Analyzing dataset to create smart configuration...")
 
         token = kwargs.get("token")
@@ -212,8 +214,30 @@ class PipelineConfig(BaseModel):
         elif dataset_repo_id:
             try:
                 from datasets import load_dataset
+
+                # Check splits if not provided
+                if not split:
+                    try:
+                        splits = get_dataset_splits(dataset_repo_id, token=token)
+                    except Exception as e:
+                        logging.warning(f"Could not fetch splits: {e}")
+                        splits = ["train"] # Fallback
+
+                    if len(splits) > 1 and "train" not in splits:
+                         # Ambiguous if no standard 'train' split
+                         # Return a dict to indicate selection needed
+                         return {
+                             "status": "split_selection_needed",
+                             "splits": splits,
+                             "message": f"Dataset has multiple splits: {splits}. Please choose one."
+                         }
+                    elif "train" in splits:
+                        split = "train"
+                    else:
+                         split = splits[0]
+
                 # Stream the dataset to get a sample
-                ds = load_dataset(dataset_repo_id, split="train", streaming=True, token=token)
+                ds = load_dataset(dataset_repo_id, split=split, streaming=True, token=token)
                 sample_data = []
                 for i, row in enumerate(ds):
                     if i >= 100:
@@ -221,8 +245,7 @@ class PipelineConfig(BaseModel):
                     sample_data.append(row)
 
                 df_sample = pl.from_dicts(sample_data)
-                # Estimate size or assume reasonably large for HF datasets if not provided
-                dataset_size = 10000  # Default to 10k to trigger moderate settings
+                dataset_size = 10000
             except Exception as e:
                 logging.error(f"Failed to stream or process the HF dataset: {e}")
                 raise
@@ -251,6 +274,7 @@ class PipelineConfig(BaseModel):
         data_cfg = DataConfig(
             file_path=file_path,
             dataset_repo_id=dataset_repo_id,
+            split=split if split else "train",
             text_columns=schema_analysis["text_columns"],
             output_column=schema_analysis["output_column"],
             image_root_path=kwargs.pop("image_root_path", None),
@@ -280,6 +304,47 @@ class PipelineConfig(BaseModel):
             llm_lr=hyperparams["llm_lr"], peft=PeftConfig(r=hyperparams["r"])
         )
         trainer_cfg = TrainerConfig(max_epochs=hyperparams["epochs"])
+
+        # --- Validation & Warnings (Step 3) ---
+
+        # Check for reasoning models
+        # Heuristic: check if config or model name suggests reasoning/thinking
+        # We can look for architectures like "ReasoningLM" (fake example) or just checks
+        is_reasoning_model = False
+        if hasattr(llm_hf_config, "architectures") and llm_hf_config.architectures:
+            for arch in llm_hf_config.architectures:
+                 if "Reasoning" in arch or "DeepSeek" in arch: # Example heuristic
+                     is_reasoning_model = True
+
+        # Also check sample data for <thinking>
+        has_thinking_tag = False
+        if is_alpaca_format:
+             # Check output column
+             out_col = schema_analysis["output_column"]
+             if out_col in df_sample.columns:
+                 sample_texts = df_sample[out_col].to_list()
+                 if any("<thinking>" in str(t) for t in sample_texts):
+                     has_thinking_tag = True
+
+        if is_reasoning_model and not has_thinking_tag:
+             warnings.warn("Model appears to be a Reasoning model, but dataset does not contain '<thinking>' tags in sample. Performance may be degraded.")
+
+        # Check for vision models
+        # If dataset has images but model is not multimodal -> handled by our custom MultimodalLLM wrapper usually.
+        # But if user wants to use native multimodal model, we should check if dataset has images.
+        is_vision_model = False
+        if hasattr(llm_hf_config, "vision_config") and llm_hf_config.vision_config:
+             is_vision_model = True
+        elif hasattr(llm_hf_config, "architectures") and llm_hf_config.architectures:
+             for arch in llm_hf_config.architectures:
+                 if "Llava" in arch or "Idefics" in arch or "Vision" in arch:
+                     is_vision_model = True
+
+        dataset_has_images = schema_analysis.get("image_column") is not None
+
+        if is_vision_model and not dataset_has_images:
+             warnings.warn("Model appears to be a Vision Language Model (VLM), but no image column was detected in the dataset.")
+
 
         logging.info(
             f"✅ Analysis complete. Smart Hyperparameters: "

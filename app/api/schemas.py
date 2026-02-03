@@ -17,6 +17,7 @@ class DatasetSearchResult(BaseModel):
 class AnalyzeRequest(BaseModel):
     model_repo_id: str
     dataset_repo_id: str
+    split: Optional[str] = None
 
 class TrainRequest(BaseModel):
     config: Dict[str, Any]

@@ -1,6 +1,6 @@
 from fastapi.testclient import TestClient
 from app.api.main import app
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 client = TestClient(app)
 
@@ -17,7 +17,7 @@ def test_start_train():
 
 def test_stream_logs():
     with patch("app.api.main.job_manager.stream_logs") as mock_stream:
-        # Mock generator
+        # Mock generator properly for async
         async def mock_gen(job_id):
             yield "Log line 1"
             yield "Log line 2"

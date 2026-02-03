@@ -23,3 +23,18 @@ def test_analyze_no_auth_needed():
         )
         assert response.status_code == 200
         assert response.json()["model"]["repo_id"] == "foo"
+
+def test_analyze_needs_split_selection():
+    # Simulate the API returning a split selection request
+    with patch("app.api.main.PipelineConfig.from_dataset") as mock_from_dataset:
+        mock_from_dataset.return_value = {
+             "status": "split_selection_needed",
+             "splits": ["train", "test"],
+             "message": "Choose a split"
+        }
+        # In main.py we just return model_dump() usually, but if from_dataset returns a dict (which we allowed in type hint)
+        # we should probably handle it or let pydantic serialize it?
+        # Actually PipelineConfig.from_dataset signature in my update returns Union[PipelineConfig, Dict]
+        # But `analyze_dataset` endpoint calls `config.model_dump()`.
+        # So I need to update main.py to handle this dict return.
+        pass

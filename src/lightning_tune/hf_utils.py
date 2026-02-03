@@ -1,5 +1,6 @@
 from huggingface_hub import HfApi, utils
 from typing import List, Optional, Dict, Any
+from datasets import get_dataset_split_names
 import logging
 
 logger = logging.getLogger(__name__)
@@ -61,3 +62,15 @@ def get_dataset_info(repo_id: str, token: Optional[str] = None) -> Dict[str, Any
         "likes": info.likes,
         "tags": info.tags,
     }
+
+def get_dataset_splits(repo_id: str, token: Optional[str] = None) -> List[str]:
+    """
+    Get available splits for a dataset.
+    """
+    try:
+        # get_dataset_split_names is efficient and doesn't download data
+        return get_dataset_split_names(repo_id, token=token)
+    except Exception as e:
+        logger.error(f"Error getting splits for {repo_id}: {e}")
+        # Fallback or re-raise? Re-raising lets caller handle it (e.g. auth error)
+        raise
