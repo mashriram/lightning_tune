@@ -41,10 +41,14 @@ dependencies = [
     "accelerate",
     "bitsandbytes",
     "datasets",
+    "fastapi",
+    "uvicorn[standard]",
+    "huggingface_hub",
+    "python-multipart"
 ]
 
 [project.optional-dependencies]
-test = ["pytest"]
+test = ["pytest", "httpx"]
 build = ["build"]
 
 [tool.setuptools.packages.find]

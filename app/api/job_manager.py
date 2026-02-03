@@ -1,0 +1,183 @@
+import subprocess
+import uuid
+import os
+from pathlib import Path
+from typing import Dict, Any, Optional, AsyncGenerator
+import asyncio
+import logging
+import yaml
+
+JOBS_DIR = Path("jobs")
+JOBS_DIR.mkdir(parents=True, exist_ok=True)
+
+logger = logging.getLogger("job_manager")
+
+class JobManager:
+    def __init__(self):
+        self.active_jobs: Dict[str, subprocess.Popen] = {}
+
+    def start_training_job(self, config_dict: Dict[str, Any], hf_token: Optional[str] = None) -> str:
+        job_id = str(uuid.uuid4())
+        job_dir = JOBS_DIR / job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+
+        # Save config
+        config_path = job_dir / "config.yaml"
+        with open(config_path, "w") as f:
+            yaml.dump(config_dict, f)
+
+        log_path = job_dir / "train.log"
+        log_file = open(log_path, "w")
+
+        env = os.environ.copy()
+        if hf_token:
+            env["HF_TOKEN"] = hf_token
+            env["HUGGING_FACE_HUB_TOKEN"] = hf_token
+
+        cmd = ["python", "-m", "lightning_tune.cli", "train", str(config_path)]
+
+        logger.info(f"Starting job {job_id} with cmd: {cmd}")
+
+        process = subprocess.Popen(
+            cmd,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            env=env,
+            cwd=os.getcwd()
+        )
+
+        # Close file handle in parent process
+        log_file.close()
+
+        self.active_jobs[job_id] = process
+        return job_id
+
+    def start_serving_job(self, job_id: Optional[str], model_path: Optional[str], config: Optional[Dict], port: int, hf_token: Optional[str]) -> str:
+        service_id = str(uuid.uuid4())
+        service_dir = JOBS_DIR / f"service_{service_id}"
+        service_dir.mkdir(parents=True, exist_ok=True)
+
+        cfg_path = None
+        mdl_path = None
+
+        if job_id:
+            job_dir = JOBS_DIR / job_id
+            if not job_dir.exists():
+                raise ValueError(f"Job {job_id} not found")
+
+            if (job_dir / "config.yaml").exists():
+                cfg_path = job_dir / "config.yaml"
+
+            # Try to find model artifact
+            candidates = ["final_adapter", "final.ckpt", "best_model.ckpt"]
+            for c in candidates:
+                if (job_dir / c).exists():
+                    mdl_path = job_dir / c
+                    break
+
+        if model_path:
+            mdl_path = Path(model_path)
+
+        if config:
+            # User provided config overrides or standalone config
+            # Merge or use?
+            # If cfg_path exists, we load it and update.
+            base_cfg = {}
+            if cfg_path:
+                with open(cfg_path, "r") as f:
+                    base_cfg = yaml.safe_load(f)
+
+            # recursive update or just simple update?
+            # simple update of top level keys
+            base_cfg.update(config)
+
+            cfg_path = service_dir / "user_config.yaml"
+            with open(cfg_path, "w") as f:
+                yaml.dump(base_cfg, f)
+
+        if not cfg_path or not cfg_path.exists():
+            raise ValueError("Configuration not found. Please provide config or valid job_id.")
+
+        if not mdl_path or not mdl_path.exists():
+            raise ValueError("Model artifact not found. Please provide model_path or valid job_id with artifacts.")
+
+        # Update port in config
+        with open(cfg_path, "r") as f:
+            final_cfg = yaml.safe_load(f)
+
+        if "deployment" not in final_cfg:
+            final_cfg["deployment"] = {}
+        final_cfg["deployment"]["port"] = port
+
+        final_cfg_path = service_dir / "serve_config.yaml"
+        with open(final_cfg_path, "w") as f:
+            yaml.dump(final_cfg, f)
+
+        log_path = service_dir / "serve.log"
+        log_file = open(log_path, "w")
+
+        env = os.environ.copy()
+        if hf_token:
+            env["HF_TOKEN"] = hf_token
+            env["HUGGING_FACE_HUB_TOKEN"] = hf_token
+
+        cmd = ["python", "-m", "lightning_tune.cli", "serve", str(final_cfg_path), str(mdl_path)]
+
+        logger.info(f"Starting service {service_id} on port {port}")
+
+        process = subprocess.Popen(
+            cmd,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            env=env,
+            cwd=os.getcwd()
+        )
+
+        # Close file handle in parent process
+        log_file.close()
+
+        self.active_jobs[f"service_{service_id}"] = process
+        return service_id
+
+    def get_job_status(self, job_id: str) -> str:
+        if job_id not in self.active_jobs:
+            if (JOBS_DIR / job_id).exists():
+                 return "stopped"
+            if (JOBS_DIR / f"service_{job_id}").exists(): # Handle service prefix in ID if user passed just UUID
+                 return "stopped"
+            return "not_found"
+
+        process = self.active_jobs[job_id]
+        ret = process.poll()
+        if ret is None:
+            return "running"
+        elif ret == 0:
+            return "completed"
+        else:
+            return "failed"
+
+    async def stream_logs(self, job_id: str) -> AsyncGenerator[str, None]:
+        # Handle service logs too?
+        # If job_id starts with service_, look in service dir
+        if job_id.startswith("service_"):
+             log_path = JOBS_DIR / job_id / "serve.log"
+        else:
+             log_path = JOBS_DIR / job_id / "train.log"
+
+        if not log_path.exists():
+            yield "Log file not found."
+            return
+
+        with open(log_path, "r") as f:
+            while True:
+                line = f.readline()
+                if line:
+                    yield line
+                else:
+                    status = self.get_job_status(job_id)
+                    if status != "running":
+                        yield f.read()
+                        break
+                    await asyncio.sleep(0.5)
+
+job_manager = JobManager()
