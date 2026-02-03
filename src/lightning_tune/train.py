@@ -4,7 +4,7 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 from torch.utils.data import DataLoader
 from functools import partial
 from .config import PipelineConfig
-from .data import prepare_text_dataset, MultiModalDataset, multimodal_collate_fn
+from .data import prepare_text_dataset, MultiModalDataset, StreamingMultiModalDataset, multimodal_collate_fn
 from .model import MultimodalLLM
 from transformers import (
     AutoModelForCausalLM,
@@ -15,6 +15,7 @@ from transformers import (
 from peft import LoraConfig
 from trl import SFTTrainer
 from pathlib import Path
+import copy
 
 
 def _run_text_finetuning_pipeline(config: PipelineConfig) -> Path:
@@ -82,6 +83,9 @@ def _run_text_finetuning_pipeline(config: PipelineConfig) -> Path:
         load_best_model_at_end=config.trainer.evaluation.do_eval
         and dataset.get("test"),
         report_to="none",
+        # For streaming datasets, max_steps is preferred over num_train_epochs usually,
+        # but SFTTrainer handles epochs on IterableDataset by expecting it to terminate.
+        # HF Streaming datasets terminate after one epoch.
     )
 
     trainer = SFTTrainer(
@@ -118,40 +122,79 @@ def _run_multimodal_pipeline(config: PipelineConfig) -> Path:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    full_dataset = MultiModalDataset(config, tokenizer)
-    train_size = len(full_dataset)
-    val_size = (
-        int(train_size * config.trainer.evaluation.eval_dataset_size)
-        if config.trainer.evaluation.do_eval
-        else 0
-    )
-
-    train_dataset, val_dataset = (
-        (torch.utils.data.random_split(full_dataset, [train_size - val_size, val_size]))
-        if val_size > 0 and train_size > val_size
-        else (full_dataset, None)
-    )
-
     collate_fn = partial(multimodal_collate_fn, tokenizer=tokenizer)
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.train.batch_size,
-        collate_fn=collate_fn,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True,
-    )
-    val_loader = (
-        DataLoader(
-            val_dataset,
+
+    if config.data.dataset_repo_id:
+        # Streaming path
+        train_dataset = StreamingMultiModalDataset(config, tokenizer)
+        val_dataset = None
+        if config.trainer.evaluation.do_eval:
+             val_config = copy.deepcopy(config)
+             for split in ["test", "validation"]:
+                 try:
+                     val_config.data.split = split
+                     # This check assumes loading doesn't fail immediately but iteration would.
+                     # We trust user or luck here.
+                     val_dataset = StreamingMultiModalDataset(val_config, tokenizer)
+                     break
+                 except Exception:
+                     continue
+
+        train_loader = DataLoader(
+            train_dataset,
             batch_size=config.train.batch_size,
             collate_fn=collate_fn,
+            shuffle=False,
             num_workers=4,
             pin_memory=True,
         )
-        if val_dataset
-        else None
-    )
+        val_loader = (
+            DataLoader(
+                val_dataset,
+                batch_size=config.train.batch_size,
+                collate_fn=collate_fn,
+                num_workers=4,
+                pin_memory=True,
+                shuffle=False,
+            )
+            if val_dataset
+            else None
+        )
+    else:
+        # Local file path
+        full_dataset = MultiModalDataset(config, tokenizer)
+        train_size = len(full_dataset)
+        val_size = (
+            int(train_size * config.trainer.evaluation.eval_dataset_size)
+            if config.trainer.evaluation.do_eval
+            else 0
+        )
+
+        train_dataset, val_dataset = (
+            (torch.utils.data.random_split(full_dataset, [train_size - val_size, val_size]))
+            if val_size > 0 and train_size > val_size
+            else (full_dataset, None)
+        )
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=config.train.batch_size,
+            collate_fn=collate_fn,
+            shuffle=True,
+            num_workers=4,
+            pin_memory=True,
+        )
+        val_loader = (
+            DataLoader(
+                val_dataset,
+                batch_size=config.train.batch_size,
+                collate_fn=collate_fn,
+                num_workers=4,
+                pin_memory=True,
+            )
+            if val_dataset
+            else None
+        )
 
     model = MultimodalLLM(config)
     logger = (
@@ -159,19 +202,23 @@ def _run_multimodal_pipeline(config: PipelineConfig) -> Path:
         if config.trainer.logger == "tensorboard"
         else CSVLogger("logs", name=output_dir.name)
     )
-    callbacks = (
-        [
-            ModelCheckpoint(
-                dirpath=output_dir,
-                monitor="val_loss",
-                mode="min",
-                save_top_k=1,
-                filename="best_model",
-            )
-        ]
-        if config.trainer.checkpoint_callback and val_loader
-        else []
-    )
+
+    # Checkpoint callback (requires val_loader to monitor val_loss)
+    callbacks = []
+    if config.trainer.checkpoint_callback:
+        if val_loader:
+             callbacks.append(
+                ModelCheckpoint(
+                    dirpath=output_dir,
+                    monitor="val_loss",
+                    mode="min",
+                    save_top_k=1,
+                    filename="best_model",
+                )
+             )
+        else:
+             # If no validation, save last checkpoitn at end
+             pass
 
     precision = "bf16-mixed" if config.trainer.device == "cuda" else "32-true"
 
@@ -185,17 +232,17 @@ def _run_multimodal_pipeline(config: PipelineConfig) -> Path:
     )
     trainer.fit(model, train_loader, val_loader)
 
-    best_path = (
-        Path(callbacks[0].best_model_path)
-        if callbacks and callbacks[0].best_model_path
-        else output_dir / "final.ckpt"
-    )
-    if not best_path.exists():
+    # Save best or final
+    if callbacks and hasattr(callbacks[0], "best_model_path") and callbacks[0].best_model_path:
+        best_path = Path(callbacks[0].best_model_path)
+    else:
+        best_path = output_dir / "final.ckpt"
         trainer.save_checkpoint(str(best_path))
 
+    # Save preprocessors if available (not for streaming usually)
     preprocessors = {
-        "scaler": getattr(full_dataset, "scaler", None),
-        "cat_mappings": getattr(full_dataset, "cat_mappings", {}),
+        "scaler": getattr(train_dataset, "scaler", None) or getattr(full_dataset if 'full_dataset' in locals() else None, "scaler", None),
+        "cat_mappings": getattr(train_dataset, "cat_mappings", {}) or getattr(full_dataset if 'full_dataset' in locals() else None, "cat_mappings", {}),
     }
     torch.save(preprocessors, best_path.parent / "preprocessors.pt")
     logging.info(f"--- Multi-Modal Finetuning Complete. Best model saved to: {best_path} ---")

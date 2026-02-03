@@ -1,6 +1,6 @@
 import logging, warnings
-from pydantic import BaseModel, Field
-from typing import List, Literal, Optional, Dict
+from pydantic import BaseModel, Field, model_validator
+from typing import List, Literal, Optional, Dict, Any
 from pathlib import Path
 import polars as pl
 
@@ -31,7 +31,10 @@ class VisionConfig(BaseModel):
 
 
 class DataConfig(BaseModel):
-    file_path: Path
+    file_path: Optional[Path] = None
+    dataset_repo_id: Optional[str] = None
+    subset: Optional[str] = None
+    split: str = "train"
     instruction_column: str = "instruction"
     input_column: str = "input"
     output_column: str = "output"
@@ -40,6 +43,12 @@ class DataConfig(BaseModel):
     max_seq_length: int = 512
     tabular_config: Optional[TabularConfig] = None
     vision_config: Optional[VisionConfig] = None
+
+    @model_validator(mode='after')
+    def check_source(self):
+        if not self.file_path and not self.dataset_repo_id:
+            raise ValueError("Must provide either 'file_path' or 'dataset_repo_id'.")
+        return self
 
 
 class EvaluationConfig(BaseModel):
@@ -183,16 +192,44 @@ class PipelineConfig(BaseModel):
 
     @classmethod
     def from_dataset(
-        cls, model_repo_id: str, file_path: Path, **kwargs
+        cls,
+        model_repo_id: str,
+        file_path: Optional[Path] = None,
+        dataset_repo_id: Optional[str] = None,
+        **kwargs
     ) -> "PipelineConfig":
-        logging.info(f"🔬 Analyzing dataset '{file_path}' to create smart configuration...")
-        try:
-            df, df_sample = cls._read_and_sample_dataset(file_path)
-        except Exception as e:
-            logging.error(f"Failed to read or process the dataset: {e}")
-            raise
+        logging.info(f"🔬 Analyzing dataset to create smart configuration...")
 
-        is_alpaca_format = all(c in df.columns for c in ["instruction", "input", "output"])
+        token = kwargs.get("token")
+
+        if file_path:
+            try:
+                df, df_sample = cls._read_and_sample_dataset(file_path)
+                dataset_size = df.height
+            except Exception as e:
+                logging.error(f"Failed to read or process the local dataset: {e}")
+                raise
+        elif dataset_repo_id:
+            try:
+                from datasets import load_dataset
+                # Stream the dataset to get a sample
+                ds = load_dataset(dataset_repo_id, split="train", streaming=True, token=token)
+                sample_data = []
+                for i, row in enumerate(ds):
+                    if i >= 100:
+                        break
+                    sample_data.append(row)
+
+                df_sample = pl.from_dicts(sample_data)
+                # Estimate size or assume reasonably large for HF datasets if not provided
+                dataset_size = 10000  # Default to 10k to trigger moderate settings
+            except Exception as e:
+                logging.error(f"Failed to stream or process the HF dataset: {e}")
+                raise
+        else:
+            raise ValueError("Must provide either 'file_path' or 'dataset_repo_id'.")
+
+        is_alpaca_format = all(c in df_sample.columns for c in ["instruction", "input", "output"])
 
         if is_alpaca_format:
             schema_analysis = {
@@ -206,11 +243,14 @@ class PipelineConfig(BaseModel):
             }
         else:
             schema_analysis = cls._analyze_schema(df_sample)
-        hyperparams = cls._suggest_hyperparameters(df.height)
+
+        hyperparams = cls._suggest_hyperparameters(dataset_size)
 
         llm_hf_config = cls._get_llm_hf_config(model_repo_id)
+
         data_cfg = DataConfig(
             file_path=file_path,
+            dataset_repo_id=dataset_repo_id,
             text_columns=schema_analysis["text_columns"],
             output_column=schema_analysis["output_column"],
             image_root_path=kwargs.pop("image_root_path", None),
