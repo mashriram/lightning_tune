@@ -15,10 +15,11 @@ from transformers import (
     BitsAndBytesConfig,
     AutoConfig
 )
-from peft import LoraConfig
+from peft import LoraConfig, PeftModel
 from trl import SFTTrainer
 from pathlib import Path
 import copy
+from huggingface_hub import HfApi
 
 
 def _run_text_finetuning_pipeline(config: PipelineConfig) -> Path:
@@ -87,6 +88,9 @@ def _run_text_finetuning_pipeline(config: PipelineConfig) -> Path:
         load_best_model_at_end=config.trainer.evaluation.do_eval
         and dataset.get("test"),
         report_to="none",
+        push_to_hub=config.train.push_to_hub,
+        hub_model_id=config.train.hub_model_id,
+        hub_token=None # Will use env var HF_TOKEN
     )
 
     trainer = SFTTrainer(
@@ -106,6 +110,11 @@ def _run_text_finetuning_pipeline(config: PipelineConfig) -> Path:
 
     final_adapter_path = output_dir / "final_adapter"
     trainer.save_model(str(final_adapter_path))
+
+    if config.train.push_to_hub:
+         trainer.push_to_hub()
+         logging.info(f"Pushed to hub: {config.train.hub_model_id}")
+
     logging.info(f"--- Finetuning Complete. Adapter saved to: {final_adapter_path} ---")
     return final_adapter_path
 
@@ -254,6 +263,33 @@ def _run_multimodal_pipeline(config: PipelineConfig) -> Path:
         "cat_mappings": getattr(train_dataset, "cat_mappings", {}) or getattr(full_dataset if 'full_dataset' in locals() else None, "cat_mappings", {}),
     }
     torch.save(preprocessors, best_path.parent / "preprocessors.pt")
+
+    if config.train.push_to_hub and config.train.hub_model_id:
+        logging.info(f"Pushing to hub: {config.train.hub_model_id}")
+        try:
+            # Need to create repo if not exists
+            api = HfApi()
+            api.create_repo(repo_id=config.train.hub_model_id, exist_ok=True)
+
+            # Since we are using LightningModule, we need to extract the model and save as PEFT adapter if native
+            # OR upload the checkpoint.
+            # Usually users want the PEFT adapter.
+
+            if model.is_native_vlm:
+                # self.llm is a PeftModel
+                model.llm.push_to_hub(config.train.hub_model_id)
+            else:
+                # Custom towers + frozen LLM.
+                # We haven't implemented saving custom towers as HF model easily.
+                # Usually we push the checkpoint.
+                api.upload_folder(
+                    folder_path=str(output_dir),
+                    repo_id=config.train.hub_model_id,
+                    repo_type="model",
+                )
+        except Exception as e:
+            logging.error(f"Failed to push to hub: {e}")
+
     logging.info(f"--- Multi-Modal Finetuning Complete. Best model saved to: {best_path} ---")
     return best_path
 

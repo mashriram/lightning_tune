@@ -21,6 +21,8 @@ class AnalyzeRequest(BaseModel):
 
 class TrainRequest(BaseModel):
     config: Dict[str, Any]
+    push_to_hub: bool = False
+    hub_model_id: Optional[str] = None
 
 class ServeRequest(BaseModel):
     job_id: Optional[str] = None
@@ -33,3 +35,8 @@ class JobResponse(BaseModel):
     status: str
     output_dir: Optional[str] = None
     service_url: Optional[str] = None
+
+class PushRequest(BaseModel):
+    job_id: str
+    hub_model_id: str
+    private: bool = False

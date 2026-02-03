@@ -73,6 +73,8 @@ class TrainConfig(BaseModel):
     llm_lr: float = 5e-5
     tower_lr: float = 1e-4
     batch_size: int = 2
+    push_to_hub: bool = False
+    hub_model_id: Optional[str] = None
 
 
 class DeploymentConfig(BaseModel):
@@ -308,8 +310,6 @@ class PipelineConfig(BaseModel):
         # --- Validation & Warnings (Step 3) ---
 
         # Check for reasoning models
-        # Heuristic: check if config or model name suggests reasoning/thinking
-        # We can look for architectures like "ReasoningLM" (fake example) or just checks
         is_reasoning_model = False
         if hasattr(llm_hf_config, "architectures") and llm_hf_config.architectures:
             for arch in llm_hf_config.architectures:
@@ -330,8 +330,6 @@ class PipelineConfig(BaseModel):
              warnings.warn("Model appears to be a Reasoning model, but dataset does not contain '<thinking>' tags in sample. Performance may be degraded.")
 
         # Check for vision models
-        # If dataset has images but model is not multimodal -> handled by our custom MultimodalLLM wrapper usually.
-        # But if user wants to use native multimodal model, we should check if dataset has images.
         is_vision_model = False
         if hasattr(llm_hf_config, "vision_config") and llm_hf_config.vision_config:
              is_vision_model = True

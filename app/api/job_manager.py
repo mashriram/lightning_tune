@@ -6,6 +6,7 @@ from typing import Dict, Any, Optional, AsyncGenerator
 import asyncio
 import logging
 import yaml
+from huggingface_hub import HfApi
 
 JOBS_DIR = Path("jobs")
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
@@ -79,16 +80,11 @@ class JobManager:
             mdl_path = Path(model_path)
 
         if config:
-            # User provided config overrides or standalone config
-            # Merge or use?
-            # If cfg_path exists, we load it and update.
             base_cfg = {}
             if cfg_path:
                 with open(cfg_path, "r") as f:
                     base_cfg = yaml.safe_load(f)
 
-            # recursive update or just simple update?
-            # simple update of top level keys
             base_cfg.update(config)
 
             cfg_path = service_dir / "user_config.yaml"
@@ -138,6 +134,34 @@ class JobManager:
 
         self.active_jobs[f"service_{service_id}"] = process
         return service_id
+
+    def push_to_hub(self, job_id: str, hub_model_id: str, private: bool, hf_token: str):
+        job_dir = JOBS_DIR / job_id
+        if not job_dir.exists():
+            raise ValueError(f"Job {job_id} not found")
+
+        # Find artifacts
+        artifact_path = None
+        if (job_dir / "final_adapter").exists():
+            # Text pipeline adapter
+            artifact_path = job_dir / "final_adapter"
+            # It's a folder, upload folder
+            api = HfApi(token=hf_token)
+            api.create_repo(repo_id=hub_model_id, private=private, exist_ok=True)
+            api.upload_folder(folder_path=str(artifact_path), repo_id=hub_model_id, repo_type="model")
+            return f"Uploaded adapter to {hub_model_id}"
+
+        elif (job_dir / "final.ckpt").exists() or (job_dir / "best_model.ckpt").exists():
+            # Multimodal pipeline
+            # Just upload the whole job dir (excluding logs maybe) or just checkpoints?
+            # User usually wants the checkpoint.
+            api = HfApi(token=hf_token)
+            api.create_repo(repo_id=hub_model_id, private=private, exist_ok=True)
+            api.upload_folder(folder_path=str(job_dir), repo_id=hub_model_id, repo_type="model", ignore_patterns=["*.log", "config.yaml"])
+            return f"Uploaded checkpoints to {hub_model_id}"
+
+        else:
+            raise ValueError("No artifacts found to push.")
 
     def get_job_status(self, job_id: str) -> str:
         if job_id not in self.active_jobs:

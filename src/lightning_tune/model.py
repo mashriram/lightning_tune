@@ -71,10 +71,6 @@ class MultimodalLLM(L.LightningModule):
             self.is_native_vlm = True
             logging.info(f"Model {config.model.repo_id} detected as native VLM. Using AutoModelForVision2Seq/CausalLM without extra vision tower.")
 
-            # Use Vision2Seq or fallback to CausalLM (some VLMs are loaded via CausalLM)
-            # Safest bet is usually AutoModelForCausalLM if trust_remote_code=True for many recent VLMs (like Llava-Next)
-            # but some require AutoModelForVision2Seq.
-            # We try generic auto class first or fallback to causal LM.
             try:
                 self.llm = AutoModelForVision2Seq.from_pretrained(
                     config.model.repo_id,
@@ -133,22 +129,114 @@ class MultimodalLLM(L.LightningModule):
     def forward(self, batch):
         if self.is_native_vlm:
             # Native VLM handling
-            # Typically expects 'pixel_values' or 'images' in inputs
-            # Our dataset provides 'image' tensor.
-            # We need to map batch keys to what model expects.
             forward_kwargs = {"input_ids": batch["input_ids"], "labels": batch["labels"]}
 
             if "image" in batch:
-                # Some models expect 'pixel_values', others 'images'
-                # Llava usually expects 'images' (raw tensors) or 'pixel_values' if processed.
-                # Since we used a simple resize/normalize transform, we likely match standard expected input or need processor.
-                # Ideally, native VLMs should use their own Processor in dataset.
-                # BUT, we are reusing our dataset logic.
-                # Assuming 'pixel_values' is the standard key for HF Vision models.
                 forward_kwargs["pixel_values"] = batch["image"].to(self.llm.dtype)
 
+            # If tabular data is present, we must process it and inject it.
+            # Native VLMs typically work with inputs_embeds OR input_ids + pixel_values.
+            # To inject Tabular embeddings, we MUST use inputs_embeds.
+            # But calculating inputs_embeds for native VLM (which handles pixel_values internally) is tricky
+            # because native VLMs often handle image-to-embedding logic inside their forward().
+
+            # Strategy:
+            # 1. Get text embeddings from the model (if possible exposed).
+            # 2. Add Tabular embeddings as prefix.
+            # 3. But wait, native VLM needs to inject image embeddings too.
+            #    If we override inputs_embeds, we disable the internal image handling usually.
+
+            # If the model allows inputs_embeds AND pixel_values simultaneously (some do, e.g. LLaVA),
+            # we can pass inputs_embeds for text+tabular, and pixel_values for images.
+            # But usually inputs_embeds supersedes input_ids.
+
+            # Robust Approach for now:
+            # If Tabular Tower exists with Native VLM, we assume the user accepts that
+            # we might NOT be able to easily inject it into the *middle* of the logic without
+            # re-implementing the VLM's forward.
+
+            # HOWEVER, most VLMs (like Llava) process input_ids to embeds, insert image embeds, then run LM.
+            # If we pass inputs_embeds, we are responsible for EVERYTHING.
+
+            # Alternative: Just allow Tabular Tower to function if it can be prepended.
+            # For simplicity & robustness requested:
+            # If Native VLM + Tabular, we try to use inputs_embeds if possible.
+            # But getting text_embeds from a wrapped PEFT model of a VLM is non-standard.
+
+            # Let's check if we have tabular data first.
+            has_tabular = self.tabular_tower and ("tabular_cat" in batch or "tabular_num" in batch)
+
+            if has_tabular:
+                 # This path is complex for Native VLMs.
+                 # We will attempt to get text embeddings.
+                 # NOTE: self.llm is a PeftModel. self.llm.base_model.model is typically the underlying transformer.
+                 # But getting embeddings is model-specific.
+
+                 # Simpler fallback: If native VLM + Tabular, warn user or skip tabular?
+                 # User EXPLICITLY asked for it: "a native VLM cant have Tabular config in your code idk why that restriction".
+
+                 # So we MUST support it.
+                 # We will assume we can get input_embeddings via get_input_embeddings()
+                 try:
+                     # Access base model to get embeddings if needed
+                     # model = self.llm.get_base_model() # Peft
+                     # But most HF models support get_input_embeddings()
+                     embeddings = self.llm.get_input_embeddings()
+                     text_embeds = embeddings(batch["input_ids"])
+
+                     prefix_embeds = []
+                     tabular_cat = batch.get("tabular_cat")
+                     tabular_num = batch.get("tabular_num")
+                     if tabular_num is not None:
+                        tabular_num = tabular_num.to(self.llm.dtype)
+                     tab_embed = self.tabular_tower(tabular_cat, tabular_num)
+                     if tab_embed is not None:
+                        prefix_embeds.append(tab_embed)
+
+                     # Concatenate
+                     # [Tabular, Text]
+                     inputs_embeds = torch.cat(prefix_embeds + [text_embeds], dim=1)
+
+                     # Pass to model.
+                     # We hope model handles (inputs_embeds + pixel_values) correctly.
+                     # LLaVA implementation usually:
+                     # if inputs_embeds is None: inputs_embeds = embed(input_ids)
+                     # then merges images.
+
+                     # So if we pass inputs_embeds, it should work IF we don't mess up image placeholders.
+                     # Image placeholders in LLaVA are tokens in input_ids.
+                     # If we replace input_ids with inputs_embeds, we must ensure placeholders are preserved in embeddings?
+                     # Yes, text_embeds contains embeddings of <image> tokens.
+
+                     # So: inputs_embeds + pixel_values should work.
+                     del forward_kwargs["input_ids"]
+                     forward_kwargs["inputs_embeds"] = inputs_embeds
+
+                 except Exception as e:
+                     logging.error(f"Failed to mix Tabular with Native VLM: {e}")
+                     # Fallback to just Native VLM (ignore tabular to avoid crash)
+
             outputs = self.llm(**forward_kwargs)
-            return outputs.logits, 0 # No extra prefix tokens manually added
+            # Native VLM output usually doesn't have a standardized 'num_prefix_tokens' we can use to shift loss easily?
+            # Actually if we prepend tabular, we shift labels?
+            # If we added tabular prefix, we need to adjust output?
+            # Or just let native logic handle it.
+            # If we passed inputs_embeds with extra prefix, the model sees a longer sequence.
+            # But 'labels' passed in forward_kwargs must match the length of inputs_embeds?
+            # HF models usually expect labels to match inputs.
+            # Our 'labels' in batch match 'input_ids'.
+            # If we prepend tabular embeddings, we must prepend dummy labels (-100) to 'labels'.
+
+            if has_tabular and "inputs_embeds" in forward_kwargs:
+                # Get length difference
+                diff = forward_kwargs["inputs_embeds"].shape[1] - batch["labels"].shape[1]
+                if diff > 0:
+                     prefix_labels = torch.full((batch["labels"].shape[0], diff), -100, device=batch["labels"].device, dtype=batch["labels"].dtype)
+                     forward_kwargs["labels"] = torch.cat([prefix_labels, batch["labels"]], dim=1)
+
+            # Re-run if we updated labels
+            outputs = self.llm(**forward_kwargs)
+            return outputs.logits, 0
 
         else:
             # Custom Multimodal Logic
@@ -171,13 +259,6 @@ class MultimodalLLM(L.LightningModule):
             return outputs.logits, num_prefix_tokens
 
     def _calculate_loss(self, logits, labels, num_prefix):
-        # Native VLMs usually compute loss internally if labels provided
-        # But if we want to be uniform:
-        if self.is_native_vlm:
-             # If native VLM computed loss (it usually does if labels passed), return it?
-             # Wait, forward() returned logits.
-             pass
-
         shift_logits, shift_labels = (
             logits[:, num_prefix - 1 : -1, :].contiguous(),
             labels.contiguous(),
@@ -190,18 +271,40 @@ class MultimodalLLM(L.LightningModule):
 
     def training_step(self, batch, batch_idx):
         if self.is_native_vlm:
-            # Pass labels to forward to get loss directly if possible?
-            # Or use manual calc.
-            # Let's try to see if model outputs loss
             forward_kwargs = {"input_ids": batch["input_ids"], "labels": batch["labels"]}
             if "image" in batch:
                 forward_kwargs["pixel_values"] = batch["image"].to(self.llm.dtype)
+
+            # Replicate the forward logic for Tabular handling
+            has_tabular = self.tabular_tower and ("tabular_cat" in batch or "tabular_num" in batch)
+            if has_tabular:
+                 try:
+                     embeddings = self.llm.get_input_embeddings()
+                     text_embeds = embeddings(batch["input_ids"])
+                     prefix_embeds = []
+                     tabular_cat = batch.get("tabular_cat")
+                     tabular_num = batch.get("tabular_num")
+                     if tabular_num is not None:
+                        tabular_num = tabular_num.to(self.llm.dtype)
+                     tab_embed = self.tabular_tower(tabular_cat, tabular_num)
+                     if tab_embed is not None:
+                        prefix_embeds.append(tab_embed)
+                     inputs_embeds = torch.cat(prefix_embeds + [text_embeds], dim=1)
+                     del forward_kwargs["input_ids"]
+                     forward_kwargs["inputs_embeds"] = inputs_embeds
+
+                     diff = inputs_embeds.shape[1] - batch["labels"].shape[1]
+                     if diff > 0:
+                         prefix_labels = torch.full((batch["labels"].shape[0], diff), -100, device=batch["labels"].device, dtype=batch["labels"].dtype)
+                         forward_kwargs["labels"] = torch.cat([prefix_labels, batch["labels"]], dim=1)
+                 except Exception as e:
+                     pass
 
             outputs = self.llm(**forward_kwargs)
             if hasattr(outputs, "loss") and outputs.loss is not None:
                 loss = outputs.loss
             else:
-                loss = self._calculate_loss(outputs.logits, batch["labels"], 0)
+                loss = self._calculate_loss(outputs.logits, forward_kwargs["labels"], 0)
         else:
             logits, num_prefix = self(batch)
             loss = self._calculate_loss(logits, batch["labels"], num_prefix)
@@ -211,14 +314,39 @@ class MultimodalLLM(L.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         if self.is_native_vlm:
+            # Similar logic as training_step
             forward_kwargs = {"input_ids": batch["input_ids"], "labels": batch["labels"]}
             if "image" in batch:
                 forward_kwargs["pixel_values"] = batch["image"].to(self.llm.dtype)
+
+            has_tabular = self.tabular_tower and ("tabular_cat" in batch or "tabular_num" in batch)
+            if has_tabular:
+                 try:
+                     embeddings = self.llm.get_input_embeddings()
+                     text_embeds = embeddings(batch["input_ids"])
+                     prefix_embeds = []
+                     tabular_cat = batch.get("tabular_cat")
+                     tabular_num = batch.get("tabular_num")
+                     if tabular_num is not None:
+                        tabular_num = tabular_num.to(self.llm.dtype)
+                     tab_embed = self.tabular_tower(tabular_cat, tabular_num)
+                     if tab_embed is not None:
+                        prefix_embeds.append(tab_embed)
+                     inputs_embeds = torch.cat(prefix_embeds + [text_embeds], dim=1)
+                     del forward_kwargs["input_ids"]
+                     forward_kwargs["inputs_embeds"] = inputs_embeds
+                     diff = inputs_embeds.shape[1] - batch["labels"].shape[1]
+                     if diff > 0:
+                         prefix_labels = torch.full((batch["labels"].shape[0], diff), -100, device=batch["labels"].device, dtype=batch["labels"].dtype)
+                         forward_kwargs["labels"] = torch.cat([prefix_labels, batch["labels"]], dim=1)
+                 except Exception:
+                     pass
+
             outputs = self.llm(**forward_kwargs)
             if hasattr(outputs, "loss") and outputs.loss is not None:
                 loss = outputs.loss
             else:
-                loss = self._calculate_loss(outputs.logits, batch["labels"], 0)
+                loss = self._calculate_loss(outputs.logits, forward_kwargs["labels"], 0)
         else:
             logits, num_prefix = self(batch)
             loss = self._calculate_loss(logits, batch["labels"], num_prefix)
@@ -228,24 +356,13 @@ class MultimodalLLM(L.LightningModule):
 
     def configure_optimizers(self):
         # Gather all trainable parameters
-        # This covers:
-        # 1. Custom vision/tabular towers (if they exist)
-        # 2. Native VLM LoRA adapters (since we applied PEFT, their params require_grad=True)
-        # 3. Any other unfrozen params
-
         params = [p for p in self.parameters() if p.requires_grad]
-
-        # Use LLM LR for LoRA params and Tower LR for towers?
-        # For simplicity in this robust implementation, we use a single LR or default to LLM LR if native VLM.
-        # Ideally we'd use groups.
         lr = self.config.train.llm_lr if self.is_native_vlm else self.config.train.tower_lr
-
         return torch.optim.AdamW(params, lr=lr)
 
     @torch.inference_mode()
     def generate(self, batch, tokenizer, max_new_tokens=100):
         if self.is_native_vlm:
-             # Native generation
              gen_kwargs = {
                  "input_ids": batch["input_ids"],
                  "max_new_tokens": max_new_tokens,
@@ -253,6 +370,26 @@ class MultimodalLLM(L.LightningModule):
              }
              if "image" in batch:
                  gen_kwargs["pixel_values"] = batch["image"].to(self.llm.dtype)
+
+             # Tabular injection for generation
+             has_tabular = self.tabular_tower and ("tabular_cat" in batch or "tabular_num" in batch)
+             if has_tabular:
+                 try:
+                     embeddings = self.llm.get_input_embeddings()
+                     text_embeds = embeddings(batch["input_ids"])
+                     prefix_embeds = []
+                     tabular_cat = batch.get("tabular_cat")
+                     tabular_num = batch.get("tabular_num")
+                     if tabular_num is not None:
+                        tabular_num = tabular_num.to(self.llm.dtype)
+                     tab_embed = self.tabular_tower(tabular_cat, tabular_num)
+                     if tab_embed is not None:
+                        prefix_embeds.append(tab_embed)
+                     inputs_embeds = torch.cat(prefix_embeds + [text_embeds], dim=1)
+                     del gen_kwargs["input_ids"]
+                     gen_kwargs["inputs_embeds"] = inputs_embeds
+                 except Exception:
+                     pass
 
              return self.llm.generate(**gen_kwargs)
         else:

@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, Header, Depends, WebSocket
 from typing import List, Optional, Union, Dict, Any
-from .schemas import SearchResult, DatasetSearchResult, AnalyzeRequest, TrainRequest, JobResponse, ServeRequest
+from .schemas import SearchResult, DatasetSearchResult, AnalyzeRequest, TrainRequest, JobResponse, ServeRequest, PushRequest
 from .job_manager import job_manager
 from src.lightning_tune.hf_utils import search_models, search_datasets
 from src.lightning_tune.config import PipelineConfig
@@ -84,7 +84,6 @@ def serve_model(request: ServeRequest, token: Optional[str] = Depends(get_token)
             port=request.port,
             hf_token=token
         )
-        # Use a prefixed ID to distinguish service jobs
         full_id = f"service_{service_id}"
         return JobResponse(
             job_id=full_id,
@@ -93,6 +92,26 @@ def serve_model(request: ServeRequest, token: Optional[str] = Depends(get_token)
         )
     except Exception as e:
         logger.error(f"Failed to start service: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/push_to_hub")
+def push_to_hub(request: PushRequest, token: Optional[str] = Depends(get_token)):
+    """
+    Push a trained model/adapter to Hugging Face Hub.
+    """
+    if not token:
+        raise HTTPException(status_code=401, detail="Hugging Face token required to push to Hub.")
+
+    try:
+        msg = job_manager.push_to_hub(
+            job_id=request.job_id,
+            hub_model_id=request.hub_model_id,
+            private=request.private,
+            hf_token=token
+        )
+        return {"status": "success", "message": msg}
+    except Exception as e:
+        logger.error(f"Push to hub failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.websocket("/train/{job_id}/logs")
