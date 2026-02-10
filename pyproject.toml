@@ -41,6 +41,7 @@ dependencies = [
     "accelerate",
     "bitsandbytes",
     "datasets",
+    "torch>=2.9.0",
 ]
 
 [project.optional-dependencies]
