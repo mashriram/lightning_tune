@@ -53,7 +53,7 @@ class JobManager:
         self.active_jobs[job_id] = process
         return job_id
 
-    def start_serving_job(self, job_id: Optional[str], model_path: Optional[str], config: Optional[Dict], port: int, hf_token: Optional[str]) -> str:
+    def start_serving_job(self, job_id: Optional[str], model_path: Optional[str], config: Optional[Dict], port: int, use_vllm: bool, hf_token: Optional[str]) -> str:
         service_id = str(uuid.uuid4())
         service_dir = JOBS_DIR / f"service_{service_id}"
         service_dir.mkdir(parents=True, exist_ok=True)
@@ -104,6 +104,7 @@ class JobManager:
         if "deployment" not in final_cfg:
             final_cfg["deployment"] = {}
         final_cfg["deployment"]["port"] = port
+        final_cfg["deployment"]["use_vllm"] = use_vllm
 
         final_cfg_path = service_dir / "serve_config.yaml"
         with open(final_cfg_path, "w") as f:
@@ -134,6 +135,18 @@ class JobManager:
 
         self.active_jobs[f"service_{service_id}"] = process
         return service_id
+
+    def stop_job(self, job_id: str) -> bool:
+        if job_id in self.active_jobs:
+            process = self.active_jobs[job_id]
+            if process.poll() is None:
+                 process.terminate()
+                 try:
+                     process.wait(timeout=5)
+                 except subprocess.TimeoutExpired:
+                     process.kill()
+                 return True
+        return False
 
     def push_to_hub(self, job_id: str, hub_model_id: str, private: bool, hf_token: str):
         job_dir = JOBS_DIR / job_id

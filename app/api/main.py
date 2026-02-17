@@ -67,25 +67,22 @@ def analyze_dataset(request: AnalyzeRequest, token: Optional[str] = Depends(get_
     """
     try:
         # Check if file path or repo id
+        # Check inputs
         kwargs = {}
+        if request.datasets:
+            kwargs["datasets"] = request.datasets
+
         if request.file_path:
             kwargs["file_path"] = Path(request.file_path)
-            # If file path implies multimodal (images in zip?), usually handled by user ensuring paths are relative?
-            # Or simplified: we assume images are not uploaded via single file endpoint easily for now unless zip.
-            # But PipelineConfig usually expects a csv pointing to images on disk.
-            # For simplicity in this demo API, we treat upload as the data file.
-            # Image root path might be an issue if images are separate.
-            # We assume user uploads self-contained or text-only if single file.
-            # If zip, we could extract.
-            # For now, pass file_path.
+            # Legacy single file handling logic if needed
             if request.file_path.endswith(".zip"):
-                 # Optional: Unzip logic?
                  pass
         elif request.dataset_repo_id:
             kwargs["dataset_repo_id"] = request.dataset_repo_id
             kwargs["split"] = request.split
-        else:
-            raise HTTPException(status_code=400, detail="Provide either dataset_repo_id or file_path")
+        
+        if not kwargs:
+            raise HTTPException(status_code=400, detail="Provide at least one dataset source (datasets list, dataset_repo_id, or file_path)")
 
         result = PipelineConfig.from_dataset(
             model_repo_id=request.model_repo_id,
@@ -114,6 +111,25 @@ def start_train(request: TrainRequest, token: Optional[str] = Depends(get_token)
         logger.error(f"Failed to start training: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/jobs/{job_id}", response_model=JobResponse)
+def get_job_status_endpoint(job_id: str, token: Optional[str] = Depends(get_token)):
+    """
+    Get the status of a job.
+    """
+    status = job_manager.get_job_status(job_id)
+    return JobResponse(job_id=job_id, status=status)
+
+@app.delete("/jobs/{job_id}")
+def stop_job_endpoint(job_id: str, token: Optional[str] = Depends(get_token)):
+    """
+    Stop a running job.
+    """
+    success = job_manager.stop_job(job_id)
+    if success:
+        return {"status": "stopped", "job_id": job_id}
+    else:
+        raise HTTPException(status_code=404, detail="Job not found or not running.")
+
 @app.post("/serve", response_model=JobResponse)
 def serve_model(request: ServeRequest, token: Optional[str] = Depends(get_token)):
     """
@@ -125,6 +141,7 @@ def serve_model(request: ServeRequest, token: Optional[str] = Depends(get_token)
             model_path=request.model_path,
             config=request.config,
             port=request.port,
+            use_vllm=request.use_vllm,
             hf_token=token
         )
         full_id = f"service_{service_id}"

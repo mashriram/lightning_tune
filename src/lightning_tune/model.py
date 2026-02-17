@@ -1,8 +1,9 @@
 import torch, torch.nn as nn, lightning as L, timm, torchmetrics
-from transformers import AutoModelForCausalLM, AutoModelForVision2Seq, AutoConfig
+from transformers import AutoModelForCausalLM, AutoModelForVision2Seq, AutoConfig, AutoModel
 from peft import get_peft_model, LoraConfig, TaskType
-from .config import PipelineConfig, TabularConfig, VisionConfig
+from .config import PipelineConfig, TabularConfig, VisionConfig, AudioConfig
 import logging
+from pathlib import Path
 
 class TabularTower(nn.Module):
     def __init__(self, config: TabularConfig):
@@ -45,7 +46,7 @@ class VisionTower(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
         self.vision_model = timm.create_model(
-            config.model_name, pretrained=True, num_classes=0
+            config.model_name, pretrained=True, num_classes=0, global_pool='avg'
         )
         self.projection = nn.Linear(
             self.vision_model.num_features, config.projection_dim
@@ -53,6 +54,31 @@ class VisionTower(nn.Module):
 
     def forward(self, images):
         return self.projection(self.vision_model(images)).unsqueeze(1)
+
+
+class AudioTower(nn.Module):
+    def __init__(self, config: AudioConfig):
+        super().__init__()
+        self.audio_model = AutoModel.from_pretrained(config.model_name)
+        # Determine output dim - usually hidden_size
+        self.out_dim = self.audio_model.config.hidden_size
+        self.projection = nn.Linear(self.out_dim, config.projection_dim)
+
+    def forward(self, audio):
+        # audio: [B, T] or [B, C, T] ? 
+        # Using simple mean pooling over time for now as a "global audio feature"
+        # Or return sequence? For simplicity in this tower, sequence [1, D]
+        outputs = self.audio_model(audio)
+        # different models have different outputs.
+        # Whisper: last_hidden_state [B, T, D]
+        if hasattr(outputs, "last_hidden_state"):
+            feat = outputs.last_hidden_state.mean(dim=1) # [B, D]
+        elif hasattr(outputs, "pooler_output"):
+             feat = outputs.pooler_output
+        else:
+             feat = outputs[0].mean(dim=1)
+        
+        return self.projection(feat).unsqueeze(1)
 
 
 class MultimodalLLM(L.LightningModule):
@@ -101,23 +127,28 @@ class MultimodalLLM(L.LightningModule):
 
         # If native VLM, we should apply PEFT (LoRA) immediately since we froze everything.
         # Otherwise we have no trainable params.
-        if self.is_native_vlm:
-             # Map our PeftConfig to Peft LoraConfig
-             peft_cfg = LoraConfig(
-                 r=config.train.peft.r,
-                 lora_alpha=config.train.peft.lora_alpha,
-                 lora_dropout=config.train.peft.lora_dropout,
-                 bias="none",
-                 task_type=TaskType.CAUSAL_LM, # Or specific type? Causal LM usually safe for next token prediction VLMs
-                 target_modules=None # Default usually works, or 'q_proj', 'v_proj'
-             )
-             self.llm = get_peft_model(self.llm, peft_cfg)
-             self.llm.print_trainable_parameters()
+        # Apply PEFT (LoRA/DoRA) to the LLM
+        # We froze the base model above. PEFT will add trainable adapters.
+        peft_cfg = LoraConfig(
+            r=config.train.peft.r,
+            lora_alpha=config.train.peft.lora_alpha,
+            lora_dropout=config.train.peft.lora_dropout,
+            bias="none",
+            task_type=TaskType.CAUSAL_LM,
+            target_modules=None, # Default usually works.
+            use_dora=(config.train.peft.method == "dora")
+        )
+        self.llm = get_peft_model(self.llm, peft_cfg)
+        self.llm.print_trainable_parameters()
 
         # Initialize towers only if NOT native VLM (for vision) or always for tabular
         self.vision_tower = None
         if config.data.vision_config and not self.is_native_vlm:
              self.vision_tower = VisionTower(config.data.vision_config)
+
+        self.audio_tower = None
+        if config.data.audio_config:
+             self.audio_tower = AudioTower(config.data.audio_config)
 
         self.tabular_tower = (
             TabularTower(config.data.tabular_config)
@@ -254,15 +285,24 @@ class MultimodalLLM(L.LightningModule):
                 if tab_embed is not None:
                     prefix_embeds.append(tab_embed)
                     num_prefix_tokens += 1
+            if self.audio_tower and "audio" in batch:
+                audio = batch["audio"].to(self.llm.dtype)
+                prefix_embeds.append(self.audio_tower(audio))
+                num_prefix_tokens += 1
             inputs_embeds = torch.cat(prefix_embeds + [text_embeds], dim=1)
             outputs = self.llm(inputs_embeds=inputs_embeds)
             return outputs.logits, num_prefix_tokens
 
     def _calculate_loss(self, logits, labels, num_prefix):
-        shift_logits, shift_labels = (
-            logits[:, num_prefix - 1 : -1, :].contiguous(),
-            labels.contiguous(),
-        )
+        if num_prefix > 0:
+            # Shift for prefix-tuning alignment (Logits[0] -> Label[0])
+            shift_logits = logits[:, num_prefix - 1 : -1, :].contiguous()
+            shift_labels = labels.contiguous()
+        else:
+            # Standard Causal Loss (Logits[t] -> Label[t+1])
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+
         return torch.nn.functional.cross_entropy(
             shift_logits.view(-1, shift_logits.size(-1)),
             shift_labels.view(-1),
@@ -415,3 +455,34 @@ class MultimodalLLM(L.LightningModule):
 
             # Slice off the input tokens to return only the generated part
             return output_tokens[:, inputs_embeds.shape[1] :]
+
+    def save_multimodal_checkpoint(self, output_dir: Path):
+        """Saves the adapter and towers in a format friendly for HF loading."""
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Save LoRA Adapter
+        if isinstance(self.llm, __import__("peft").PeftModel):
+             self.llm.save_pretrained(output_dir)
+        else:
+             # If full finetuning, save the whole model? Or just state dict?
+             # For this task, we assume LoRA primarily.
+             # If full model, maybe save_pretrained on base?
+             if hasattr(self.llm, "save_pretrained"):
+                 self.llm.save_pretrained(output_dir)
+        
+        # Save Towers
+        towers_state = {}
+        if self.vision_tower:
+             towers_state["vision_tower"] = self.vision_tower.state_dict()
+        if self.audio_tower:
+             towers_state["audio_tower"] = self.audio_tower.state_dict()
+        if self.tabular_tower:
+             towers_state["tabular_tower"] = self.tabular_tower.state_dict()
+        
+        if towers_state:
+             torch.save(towers_state, output_dir / "towers.pt")
+        
+        # Save Config
+        with open(output_dir / "pipeline_config.json", "w") as f:
+             f.write(self.config.model_dump_json(indent=2))

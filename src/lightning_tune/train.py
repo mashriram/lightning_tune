@@ -252,11 +252,21 @@ def _run_multimodal_pipeline(config: PipelineConfig) -> Path:
     )
     trainer.fit(model, train_loader, val_loader)
 
+    
+    # Save final model in HF format
+    if config.train.push_to_hub and config.train.hub_model_id:
+        pass # Push logic handles adapter
+    
+    # Always save local HF checkpoint
+    model.save_multimodal_checkpoint(output_dir)
+    best_path = output_dir
+
     if callbacks and hasattr(callbacks[0], "best_model_path") and callbacks[0].best_model_path:
-        best_path = Path(callbacks[0].best_model_path)
-    else:
-        best_path = output_dir / "final.ckpt"
-        trainer.save_checkpoint(str(best_path))
+         # Does ModelCheckpoint save HF format? No, usually .ckpt
+         # We might want to load best .ckpt and then save as HF?
+         # For simplicity, we save final state as HF. 
+         # If user wants best, they can load .ckpt and convert.
+         pass
 
     preprocessors = {
         "scaler": getattr(train_dataset, "scaler", None) or getattr(full_dataset if 'full_dataset' in locals() else None, "scaler", None),

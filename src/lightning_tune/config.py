@@ -3,7 +3,7 @@ from pydantic import BaseModel, Field, model_validator
 from typing import List, Literal, Optional, Dict, Any, Union
 from pathlib import Path
 import polars as pl
-from .hf_utils import get_dataset_splits
+from .hf_utils import get_dataset_splits, get_dataset_configs
 
 
 class ModelConfig(BaseModel):
@@ -31,11 +31,42 @@ class VisionConfig(BaseModel):
     projection_dim: int
 
 
-class DataConfig(BaseModel):
+class AudioConfig(BaseModel):
+    audio_column: str
+    model_name: str = "openai/whisper-tiny" # Default lightweight model
+    projection_dim: int
+
+
+class DatasetConfig(BaseModel):
+    repo_id: Optional[str] = None
     file_path: Optional[Path] = None
-    dataset_repo_id: Optional[str] = None
+    config_name: Optional[str] = None
     subset: Optional[str] = None
     split: str = "train"
+    instruction_column: str = "instruction"
+    input_column: str = "input"
+    output_column: str = "output"
+    text_columns: List[str] = Field(default_factory=list)
+    image_root_path: Optional[Path] = None
+    
+    @model_validator(mode='after')
+    def check_source(self):
+        if not self.file_path and not self.repo_id:
+            raise ValueError("Must provide either 'file_path' or 'repo_id'.")
+        return self
+
+class DataConfig(BaseModel):
+    # Deprecated single-dataset fields, kept for backward compatibility helper
+    file_path: Optional[Path] = None
+    dataset_repo_id: Optional[str] = None
+    dataset_config_name: Optional[str] = None
+    subset: Optional[str] = None
+    split: str = "train"
+    
+    # New Multi-Dataset support
+    datasets: List[DatasetConfig] = Field(default_factory=list)
+
+    # Global config
     instruction_column: str = "instruction"
     input_column: str = "input"
     output_column: str = "output"
@@ -44,11 +75,27 @@ class DataConfig(BaseModel):
     max_seq_length: int = 512
     tabular_config: Optional[TabularConfig] = None
     vision_config: Optional[VisionConfig] = None
+    audio_config: Optional[AudioConfig] = None
 
     @model_validator(mode='after')
-    def check_source(self):
-        if not self.file_path and not self.dataset_repo_id:
-            raise ValueError("Must provide either 'file_path' or 'dataset_repo_id'.")
+    def consolidate_datasets(self):
+        # If legacy fields are present and datasets list is empty, convert to a DatasetConfig
+        if not self.datasets:
+             if self.file_path or self.dataset_repo_id:
+                 self.datasets.append(DatasetConfig(
+                     repo_id=self.dataset_repo_id,
+                     file_path=self.file_path,
+                     config_name=self.dataset_config_name,
+                     subset=self.subset,
+                     split=self.split,
+                     instruction_column=self.instruction_column,
+                     input_column=self.input_column,
+                     output_column=self.output_column,
+                     text_columns=self.text_columns,
+                     image_root_path=self.image_root_path
+                 ))
+             else:
+                 pass # Might be valid if we are initializing empty? Or error.
         return self
 
 
@@ -66,6 +113,9 @@ class TrainerConfig(BaseModel):
     logger: Literal["csv", "tensorboard"] = "tensorboard"
     checkpoint_callback: bool = True
     evaluation: EvaluationConfig = Field(default_factory=EvaluationConfig)
+    limit_train_batches: Union[int, float] = 1.0
+    limit_val_batches: Union[int, float] = 1.0
+    accelerator: str = "auto"
 
 
 class TrainConfig(BaseModel):
@@ -79,6 +129,7 @@ class TrainConfig(BaseModel):
 
 class DeploymentConfig(BaseModel):
     port: int = 8000
+    use_vllm: bool = True
 
 
 class PipelineConfig(BaseModel):
@@ -91,7 +142,9 @@ class PipelineConfig(BaseModel):
     @property
     def is_multimodal(self) -> bool:
         return (
-            self.data.vision_config is not None or self.data.tabular_config is not None
+            self.data.vision_config is not None 
+            or self.data.tabular_config is not None
+            or self.data.audio_config is not None
         )
 
     def get_output_dir(self) -> Path:
@@ -103,6 +156,7 @@ class PipelineConfig(BaseModel):
     def _analyze_schema(df_sample: pl.DataFrame) -> Dict:
         analysis = {
             "image_column": None,
+            "audio_column": None,
             "text_columns": [],
             "numerical_columns": [],
             "categorical_columns": [],
@@ -114,7 +168,10 @@ class PipelineConfig(BaseModel):
         for col, dtype in df_sample.schema.items():
             l_col = col.lower()
             if ("image" in l_col or "path" in l_col) and dtype == pl.Utf8:
+                # Naive check, improved below
                 analysis["image_column"] = col
+            elif ("audio" in l_col or "sound" in l_col) and dtype == pl.Utf8:
+                analysis["audio_column"] = col
             elif dtype in [pl.Float32, pl.Float64, pl.Int32, pl.Int64]:
                 analysis["numerical_columns"].append(col)
             elif dtype == pl.Utf8:
@@ -197,63 +254,59 @@ class PipelineConfig(BaseModel):
     def from_dataset(
         cls,
         model_repo_id: str,
+        datasets: Optional[List[Dict[str, Any]]] = None,
         file_path: Optional[Path] = None,
         dataset_repo_id: Optional[str] = None,
+        dataset_config_name: Optional[str] = None,
         split: Optional[str] = None,
         **kwargs
     ) -> Union["PipelineConfig", Dict[str, Any]]:
-        logging.info(f"🔬 Analyzing dataset to create smart configuration...")
+        logging.info(f"🔬 Analyzing dataset(s) to create smart configuration...")
 
         token = kwargs.get("token")
+        
+        # Consolidate inputs into a list of "sources"
+        sources = []
+        if datasets:
+            sources.extend(datasets)
+        if file_path or dataset_repo_id:
+            sources.append({
+                "file_path": file_path,
+                "repo_id": dataset_repo_id,
+                "config_name": dataset_config_name,
+                "split": split,
+                "subset": kwargs.get("subset")
+            })
 
-        if file_path:
-            try:
-                df, df_sample = cls._read_and_sample_dataset(file_path)
-                dataset_size = df.height
-            except Exception as e:
-                logging.error(f"Failed to read or process the local dataset: {e}")
-                raise
-        elif dataset_repo_id:
-            try:
-                from datasets import load_dataset
+        if not sources:
+             raise ValueError("Must provide at least one dataset (file_path, dataset_repo_id, or datasets list).")
 
-                # Check splits if not provided
-                if not split:
-                    try:
-                        splits = get_dataset_splits(dataset_repo_id, token=token)
-                    except Exception as e:
-                        logging.warning(f"Could not fetch splits: {e}")
-                        splits = ["train"] # Fallback
+        # We will analyze the FIRST source to determine schema/hyperparams for now,
+        # or we could try to error if schemas mismatch.
+        
+        # Let's analyze the first valid source to get the global schema
+        first_source = sources[0]
+        
+        # Helper to get sample from a source
+        def get_sample(src):
+            fpath = src.get("file_path")
+            drepo = src.get("repo_id") or src.get("dataset_repo_id")
+            dconf = src.get("config_name")
+            dsplit = src.get("split")
+            
+            if fpath:
+                try:
+                    df, df_sample = cls._read_and_sample_dataset(Path(fpath))
+                    return df_sample, df.height
+                except Exception as e:
+                     raise ValueError(f"Failed to read local file {fpath}: {e}")
+            elif drepo:
+                 return cls._sample_hf_dataset(drepo, dconf, dsplit, token)
+            else:
+                 raise ValueError("Source must have file_path or repo_id")
 
-                    if len(splits) > 1 and "train" not in splits:
-                         # Ambiguous if no standard 'train' split
-                         # Return a dict to indicate selection needed
-                         return {
-                             "status": "split_selection_needed",
-                             "splits": splits,
-                             "message": f"Dataset has multiple splits: {splits}. Please choose one."
-                         }
-                    elif "train" in splits:
-                        split = "train"
-                    else:
-                         split = splits[0]
-
-                # Stream the dataset to get a sample
-                ds = load_dataset(dataset_repo_id, split=split, streaming=True, token=token)
-                sample_data = []
-                for i, row in enumerate(ds):
-                    if i >= 100:
-                        break
-                    sample_data.append(row)
-
-                df_sample = pl.from_dicts(sample_data)
-                dataset_size = 10000
-            except Exception as e:
-                logging.error(f"Failed to stream or process the HF dataset: {e}")
-                raise
-        else:
-            raise ValueError("Must provide either 'file_path' or 'dataset_repo_id'.")
-
+        df_sample, total_size = get_sample(first_source)
+        
         is_alpaca_format = all(c in df_sample.columns for c in ["instruction", "input", "output"])
 
         if is_alpaca_format:
@@ -269,14 +322,30 @@ class PipelineConfig(BaseModel):
         else:
             schema_analysis = cls._analyze_schema(df_sample)
 
-        hyperparams = cls._suggest_hyperparameters(dataset_size)
+        # Create DatasetConfig objects
+        dataset_configs = []
+        for src in sources:
+            d_cfg = DatasetConfig(
+                repo_id=src.get("repo_id") or src.get("dataset_repo_id"),
+                file_path=src.get("file_path"),
+                config_name=src.get("config_name"),
+                split=src.get("split") or "train",
+                subset=src.get("subset"),
+                instruction_column=schema_analysis.get("instruction_column", "instruction"),
+                input_column=schema_analysis.get("input_column", "input"),
+                output_column=schema_analysis.get("output_column", "output"),
+                text_columns=schema_analysis.get("text_columns", []),
+                image_root_path=kwargs.get("image_root_path") 
+            )
+            dataset_configs.append(d_cfg)
+
+        hyperparams = cls._suggest_hyperparameters(total_size)
 
         llm_hf_config = cls._get_llm_hf_config(model_repo_id)
 
         data_cfg = DataConfig(
-            file_path=file_path,
-            dataset_repo_id=dataset_repo_id,
-            split=split if split else "train",
+            datasets=dataset_configs,
+            # Global settings
             text_columns=schema_analysis["text_columns"],
             output_column=schema_analysis["output_column"],
             image_root_path=kwargs.pop("image_root_path", None),
@@ -290,6 +359,12 @@ class PipelineConfig(BaseModel):
         if schema_analysis.get("image_column"):
             data_cfg.vision_config = VisionConfig(
                 image_column=schema_analysis["image_column"],
+                projection_dim=llm_hf_config.hidden_size,
+            )
+
+        if schema_analysis.get("audio_column"):
+            data_cfg.audio_config = AudioConfig(
+                audio_column=schema_analysis["audio_column"],
                 projection_dim=llm_hf_config.hidden_size,
             )
         if (
@@ -306,44 +381,7 @@ class PipelineConfig(BaseModel):
             llm_lr=hyperparams["llm_lr"], peft=PeftConfig(r=hyperparams["r"])
         )
         trainer_cfg = TrainerConfig(max_epochs=hyperparams["epochs"])
-
-        # --- Validation & Warnings (Step 3) ---
-
-        # Check for reasoning models
-        is_reasoning_model = False
-        if hasattr(llm_hf_config, "architectures") and llm_hf_config.architectures:
-            for arch in llm_hf_config.architectures:
-                 if "Reasoning" in arch or "DeepSeek" in arch: # Example heuristic
-                     is_reasoning_model = True
-
-        # Also check sample data for <thinking>
-        has_thinking_tag = False
-        if is_alpaca_format:
-             # Check output column
-             out_col = schema_analysis["output_column"]
-             if out_col in df_sample.columns:
-                 sample_texts = df_sample[out_col].to_list()
-                 if any("<thinking>" in str(t) for t in sample_texts):
-                     has_thinking_tag = True
-
-        if is_reasoning_model and not has_thinking_tag:
-             warnings.warn("Model appears to be a Reasoning model, but dataset does not contain '<thinking>' tags in sample. Performance may be degraded.")
-
-        # Check for vision models
-        is_vision_model = False
-        if hasattr(llm_hf_config, "vision_config") and llm_hf_config.vision_config:
-             is_vision_model = True
-        elif hasattr(llm_hf_config, "architectures") and llm_hf_config.architectures:
-             for arch in llm_hf_config.architectures:
-                 if "Llava" in arch or "Idefics" in arch or "Vision" in arch:
-                     is_vision_model = True
-
-        dataset_has_images = schema_analysis.get("image_column") is not None
-
-        if is_vision_model and not dataset_has_images:
-             warnings.warn("Model appears to be a Vision Language Model (VLM), but no image column was detected in the dataset.")
-
-
+        
         logging.info(
             f"✅ Analysis complete. Smart Hyperparameters: "
             f"LR={hyperparams['llm_lr']}, Epochs={hyperparams['epochs']}, LoRA Rank={hyperparams['r']}"
@@ -355,3 +393,16 @@ class PipelineConfig(BaseModel):
             trainer=trainer_cfg,
             **kwargs,
         )
+
+    @staticmethod
+    def _sample_hf_dataset(repo_id, config_name, split, token):
+         from datasets import load_dataset
+         try:
+             ds = load_dataset(repo_id, name=config_name, split=split or "train", streaming=True, token=token)
+             sample_data = []
+             for i, row in enumerate(ds):
+                 if i >= 100: break
+                 sample_data.append(row)
+             return pl.from_dicts(sample_data), 10000 
+         except Exception as e:
+             raise ValueError(f"Failed to stream HF dataset {repo_id}: {e}")

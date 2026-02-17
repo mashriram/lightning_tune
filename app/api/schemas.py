@@ -19,6 +19,7 @@ class AnalyzeRequest(BaseModel):
     dataset_repo_id: Optional[str] = None
     file_path: Optional[str] = None
     split: Optional[str] = None
+    datasets: Optional[List[Dict[str, Any]]] = None
 
 class TrainRequest(BaseModel):
     config: Dict[str, Any]
@@ -30,6 +31,7 @@ class ServeRequest(BaseModel):
     model_path: Optional[str] = None
     config: Optional[Dict[str, Any]] = None
     port: int = 8000
+    use_vllm: bool = True
 
 class JobResponse(BaseModel):
     job_id: str
