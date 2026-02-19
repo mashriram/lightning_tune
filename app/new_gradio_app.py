@@ -97,7 +97,63 @@ def analyze_api(model, dataset, file_path, datasets_list, token, split=None):
     except Exception as e:
         return {"msg": f"Exception: {e}", "needs_split": False}
 
-# ... (start_train_api, etc. remain same) ...
+def start_train_api(config, push, hub_id, token):
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    payload = {"config": config, "push_to_hub": push, "hub_model_id": hub_id}
+    try:
+        resp = requests.post(f"{API_URL}/train", json=payload, headers=headers)
+        if resp.status_code == 200:
+            return resp.json()["job_id"]
+        gr.Error(f"Training start failed: {resp.text}")
+        return None
+    except Exception as e:
+        gr.Error(f"Connection error: {e}")
+        return None
+
+def start_serve_api(job_id, port, use_vllm, token):
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    payload = {"job_id": job_id, "port": int(port), "use_vllm": use_vllm}
+    try:
+        resp = requests.post(f"{API_URL}/serve", json=payload, headers=headers)
+        if resp.status_code == 200:
+            return resp.json()["service_url"]
+        gr.Error(f"Service start failed: {resp.text}")
+        return None
+    except Exception as e:
+        gr.Error(f"Connection error: {e}")
+        return None
+
+def push_to_hub_api(job_id, hub_id, private, token):
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    payload = {"job_id": job_id, "hub_model_id": hub_id, "private": private}
+    try:
+        resp = requests.post(f"{API_URL}/push_to_hub", json=payload, headers=headers)
+        if resp.status_code == 200:
+            return resp.json()["message"]
+        return f"Error: {resp.text}"
+    except Exception as e:
+        return f"Exception: {e}"
+
+def stop_job_api(job_id, token):
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    try:
+        resp = requests.delete(f"{API_URL}/jobs/{job_id}", headers=headers)
+        if resp.status_code == 200:
+            return "Job stopped successfully."
+        return f"Failed to stop job: {resp.text}"
+    except Exception as e:
+        return f"Connection error: {e}"
+
+def get_job_status_api(job_id, token):
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    try:
+        resp = requests.get(f"{API_URL}/jobs/{job_id}", headers=headers)
+        if resp.status_code == 200:
+            return resp.json()["status"]
+        return "Unknown"
+    except:
+        return "Connection Error"
+
 
 # UI
 with gr.Blocks(title="Lightning Tune Pro") as app:

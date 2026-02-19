@@ -1,13 +1,23 @@
+import sys
+from pathlib import Path
+
+# Add project root to sys.path to allow absolute imports
+# matching the package structure (app.api...)
+project_root = Path(__file__).resolve().parent.parent.parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
 from fastapi import FastAPI, HTTPException, Header, Depends, WebSocket, UploadFile, File
 from typing import List, Optional, Union, Dict, Any
-from pathlib import Path
 import shutil
 import uuid
-from .schemas import SearchResult, DatasetSearchResult, AnalyzeRequest, TrainRequest, JobResponse, ServeRequest, PushRequest
-from .job_manager import job_manager
+import logging
+
+# Use absolute imports
+from app.api.schemas import SearchResult, DatasetSearchResult, AnalyzeRequest, TrainRequest, JobResponse, ServeRequest, PushRequest
+from app.api.job_manager import job_manager
 from src.lightning_tune.hf_utils import search_models, search_datasets
 from src.lightning_tune.config import PipelineConfig
-import logging
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("api")
@@ -190,3 +200,7 @@ async def websocket_logs(websocket: WebSocket, job_id: str):
             await websocket.close()
         except:
             pass
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
