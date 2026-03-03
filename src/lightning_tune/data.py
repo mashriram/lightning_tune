@@ -24,49 +24,49 @@ def prepare_text_dataset(config: PipelineConfig) -> DatasetDict:
             "text": f"### Instruction:\n{example.get(config.data.instruction_column, '')}\n\n### Response:\n{example.get(config.data.output_column, '')}"
         }
 
-    if config.data.dataset_repo_id:
-        # Streaming from Hugging Face
-        logging.info(f"Streaming dataset from HF: {config.data.dataset_repo_id}")
-        dataset = load_dataset(config.data.dataset_repo_id, split=config.data.split, streaming=True)
-        dataset = dataset.map(format_prompt)
+    datasets_list = []
+    
+    # Process multiple datasets
+    sources = config.data.datasets if config.data.datasets else []
+    # legacy fallback handled during config consolidation, but just in case
+    if not sources:
+         pass
+             
+    for src in sources:
+        if src.repo_id:
+            logging.info(f"Loading dataset from HF: {src.repo_id}")
+            ds = load_dataset(src.repo_id, name=src.config_name, split=src.split or "train")
+            ds = ds.map(format_prompt)
+            datasets_list.append(ds)
+        elif src.file_path:
+            file_path = Path(src.file_path)
+            file_type = file_path.suffix.lower().replace(".", "")
+            ds = load_dataset(file_type, data_files=str(file_path), split="train")
+            ds = ds.map(format_prompt)
+            datasets_list.append(ds)
+        elif src.db_uri:
+             import polars as pl
+             import pyarrow as pa
+             from datasets import Dataset as HFDataset
+             logging.info(f"Loading dataset from DB: {src.db_uri}")
+             df = pl.read_database_uri(query=src.db_query, uri=src.db_uri, engine="connectorx")
+             ds = HFDataset(pa.Table.from_batches(df.to_arrow().to_batches()))
+             ds = ds.map(format_prompt)
+             datasets_list.append(ds)
 
-        if config.trainer.evaluation.do_eval:
-            # Check available splits
-            try:
-                available_splits = get_dataset_splits(config.data.dataset_repo_id)
-                eval_split = None
-                for split in ["test", "validation"]:
-                    if split in available_splits:
-                        eval_split = split
-                        break
-
-                if eval_split:
-                    logging.info(f"Using '{eval_split}' split for evaluation.")
-                    eval_dataset = load_dataset(config.data.dataset_repo_id, split=eval_split, streaming=True)
-                    eval_dataset = eval_dataset.map(format_prompt)
-                    return DatasetDict({"train": dataset, "test": eval_dataset})
-                else:
-                    warnings.warn("Could not find 'test' or 'validation' split. Evaluation disabled.")
-                    return DatasetDict({"train": dataset})
-
-            except Exception as e:
-                warnings.warn(f"Error checking splits: {e}. Evaluation disabled.")
-                return DatasetDict({"train": dataset})
-
-        return DatasetDict({"train": dataset})
-
+    if not datasets_list:
+        raise ValueError("No datasets could be loaded for text finetuning.")
+        
+    from datasets import concatenate_datasets
+    if len(datasets_list) > 1:
+        dataset = concatenate_datasets(datasets_list)
     else:
-        # Local File
-        file_type = config.data.file_path.suffix.lower().replace(".", "")
-        dataset = load_dataset(
-            file_type, data_files=str(config.data.file_path), split="train"
-        ).map(format_prompt)
-        return (
-            dataset.train_test_split(test_size=config.trainer.evaluation.eval_dataset_size)
-            if config.trainer.evaluation.do_eval
-            and config.trainer.evaluation.eval_dataset_size > 0
-            else DatasetDict({"train": dataset})
-        )
+        dataset = datasets_list[0]
+    
+    if config.trainer.evaluation.do_eval and config.trainer.evaluation.eval_dataset_size > 0:
+         return dataset.train_test_split(test_size=config.trainer.evaluation.eval_dataset_size)
+    else:
+         return DatasetDict({"train": dataset})
 
 
 class MultiModalDataset(Dataset):

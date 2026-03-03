@@ -16,7 +16,6 @@ from lightning_tune.config import PipelineConfig, DataConfig, ModelConfig
 class TestConfig(unittest.TestCase):
 
     def test_data_config_validation(self):
-        """Test that DataConfig requires either file_path or dataset_repo_id."""
         with self.assertRaises(ValueError):
             DataConfig()
             
@@ -115,8 +114,8 @@ class TestConfig(unittest.TestCase):
         )
         
         self.assertIsInstance(config, PipelineConfig)
-        self.assertEqual(config.data.dataset_repo_id, "dummy/dataset")
-        self.assertEqual(config.data.split, "train")
+        self.assertEqual(config.data.datasets[0].repo_id, "dummy/dataset")
+        self.assertEqual(config.data.datasets[0].split, "train")
 
 if __name__ == "__main__":
     unittest.main()

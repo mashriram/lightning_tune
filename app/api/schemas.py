@@ -18,6 +18,8 @@ class AnalyzeRequest(BaseModel):
     model_repo_id: str
     dataset_repo_id: Optional[str] = None
     file_path: Optional[str] = None
+    db_uri: Optional[str] = None
+    db_query: Optional[str] = None
     split: Optional[str] = None
     datasets: Optional[List[Dict[str, Any]]] = None
 

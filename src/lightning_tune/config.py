@@ -42,6 +42,8 @@ class DatasetConfig(BaseModel):
     file_path: Optional[Path] = None
     config_name: Optional[str] = None
     subset: Optional[str] = None
+    db_uri: Optional[str] = None
+    db_query: Optional[str] = None
     split: str = "train"
     instruction_column: str = "instruction"
     input_column: str = "input"
@@ -51,8 +53,10 @@ class DatasetConfig(BaseModel):
     
     @model_validator(mode='after')
     def check_source(self):
-        if not self.file_path and not self.repo_id:
-            raise ValueError("Must provide either 'file_path' or 'repo_id'.")
+        if not self.file_path and not self.repo_id and not self.db_uri:
+            raise ValueError("Must provide either 'file_path', 'repo_id', or 'db_uri'.")
+        if self.db_uri and not self.db_query:
+            raise ValueError("'db_query' must be provided when using 'db_uri'.")
         return self
 
 class DataConfig(BaseModel):
@@ -61,6 +65,8 @@ class DataConfig(BaseModel):
     dataset_repo_id: Optional[str] = None
     dataset_config_name: Optional[str] = None
     subset: Optional[str] = None
+    db_uri: Optional[str] = None
+    db_query: Optional[str] = None
     split: str = "train"
     
     # New Multi-Dataset support
@@ -87,6 +93,8 @@ class DataConfig(BaseModel):
                      file_path=self.file_path,
                      config_name=self.dataset_config_name,
                      subset=self.subset,
+                     db_uri=self.db_uri,
+                     db_query=self.db_query,
                      split=self.split,
                      instruction_column=self.instruction_column,
                      input_column=self.input_column,
@@ -229,7 +237,8 @@ class PipelineConfig(BaseModel):
             return {"llm_lr": 2e-5, "epochs": 1, "r": 32}
 
     @staticmethod
-    def _read_and_sample_dataset(file_path: Path) -> pl.DataFrame:
+    def _read_and_sample_dataset(file_path: Union[Path, str]) -> pl.DataFrame:
+        file_path = Path(file_path)
         file_suffix = file_path.suffix.lower()
         if file_suffix == ".csv":
             df = pl.read_csv(file_path)
@@ -287,12 +296,13 @@ class PipelineConfig(BaseModel):
         # Let's analyze the first valid source to get the global schema
         first_source = sources[0]
         
-        # Helper to get sample from a source
         def get_sample(src):
             fpath = src.get("file_path")
             drepo = src.get("repo_id") or src.get("dataset_repo_id")
             dconf = src.get("config_name")
             dsplit = src.get("split")
+            db_uri = src.get("db_uri")
+            db_query = src.get("db_query")
             
             if fpath:
                 try:
@@ -302,8 +312,18 @@ class PipelineConfig(BaseModel):
                      raise ValueError(f"Failed to read local file {fpath}: {e}")
             elif drepo:
                  return cls._sample_hf_dataset(drepo, dconf, dsplit, token)
+            elif db_uri and db_query:
+                 try:
+                     import polars as pl
+                     sample_query = db_query
+                     if "limit" not in sample_query.lower():
+                         sample_query = f"SELECT * FROM ({db_query}) AS subquery LIMIT 100"
+                     df_sample = pl.read_database_uri(query=sample_query, uri=db_uri, engine="connectorx")
+                     return df_sample, 10000 
+                 except Exception as e:
+                     raise ValueError(f"Failed to read from database: {e}")
             else:
-                 raise ValueError("Source must have file_path or repo_id")
+                 raise ValueError("Source must have file_path, repo_id, or db_uri with db_query")
 
         df_sample, total_size = get_sample(first_source)
         

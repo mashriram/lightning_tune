@@ -182,11 +182,17 @@ with gr.Blocks(title="Lightning Tune Pro") as app:
                 gr.Markdown("#### Option B: Upload File")
                 file_in = gr.File(label="Upload CSV/JSON")
                 add_file_btn = gr.Button("Add Uploaded File")
+            
+            with gr.Column(scale=1):
+                gr.Markdown("#### Option C: Database")
+                db_uri = gr.Textbox(label="Database URI", placeholder="postgresql://user:pass@host/db")
+                db_query = gr.Textbox(label="SQL Query", placeholder="SELECT * FROM table LIMIT 1000")
+                add_db_btn = gr.Button("Add Database Source")
 
         # Dataset List Display
         datasets_state = gr.State([])
         dataset_display = gr.Dataframe(
-            headers=["Type", "ID/Path", "Config", "Split"], 
+            headers=["Type", "ID/Path/URI", "Config", "Split"], 
             datatype=["str", "str", "str", "str"],
             label="Selected Datasets",
             interactive=False
@@ -204,14 +210,16 @@ with gr.Blocks(title="Lightning Tune Pro") as app:
             return None
         file_in.upload(handle_upload, inputs=[file_in], outputs=[uploaded_path])
 
+        def get_display_data(current_list):
+            return [[d.get("type"), d.get("repo_id") or d.get("file_path") or d.get("db_uri"), d.get("config_name") or "-", d.get("split") or "-"] for d in current_list]
+
         # Add buttons logic
         def add_hf_dataset(current_list, repo, conf, split):
             if not repo:
                  return current_list, gr.update()
             new_entry = {"repo_id": repo, "config_name": conf, "split": split, "type": "hf"}
             current_list.append(new_entry)
-            display_data = [[d.get("type"), d.get("repo_id"), d.get("config_name"), d.get("split")] for d in current_list]
-            return current_list, display_data
+            return current_list, get_display_data(current_list)
 
         def add_file_dataset(current_list, path):
             if not path:
@@ -219,14 +227,22 @@ with gr.Blocks(title="Lightning Tune Pro") as app:
                  return current_list, gr.update()
             new_entry = {"file_path": path, "type": "file"}
             current_list.append(new_entry)
-            display_data = [[d.get("type"), d.get("file_path"), "-", "-"] for d in current_list]
-            return current_list, display_data
+            return current_list, get_display_data(current_list)
+
+        def add_db_dataset(current_list, uri, query):
+            if not uri or not query:
+                 gr.Warning("Please provide both URI and Query.")
+                 return current_list, gr.update()
+            new_entry = {"db_uri": uri, "db_query": query, "type": "db"}
+            current_list.append(new_entry)
+            return current_list, get_display_data(current_list)
         
         def clear_datasets():
             return [], []
 
         add_hf_btn.click(add_hf_dataset, inputs=[datasets_state, data_dd, data_config_name, data_split], outputs=[datasets_state, dataset_display])
         add_file_btn.click(add_file_dataset, inputs=[datasets_state, uploaded_path], outputs=[datasets_state, dataset_display])
+        add_db_btn.click(add_db_dataset, inputs=[datasets_state, db_uri, db_query], outputs=[datasets_state, dataset_display])
         clear_ds_btn.click(clear_datasets, outputs=[datasets_state, dataset_display])
 
         gr.Markdown("---")

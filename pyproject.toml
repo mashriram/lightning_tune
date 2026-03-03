@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 readme = "README.md"
 requires-python = ">=3.12"
 name = "lightning_tune"
-version = "3.1.0"
+version = "2026.2"
 description = "A production-ready library for automated, advanced multi-modal LLM finetuning and deployment."
 authors = [
     {name = "Jules", email = "jules@example.com"},
@@ -19,7 +19,7 @@ classifiers = [
 ]
 dependencies = [
     "polars[pyarrow]>=0.20.0",
-    "litgpt @ git+https://github.com/Lightning-AI/litgpt.git",
+    "litgpt",
     "lightning[all]",
     "litserve",
     "gradio",
@@ -49,6 +49,9 @@ dependencies = [
     "ffmpeg",
     "soundfile>=0.13.1",
     "torchaudio>=2.10.0",
+    "torch>=2.10.0",
+    "twine>=6.2.0",
+    "build>=1.4.0",
 ]
 
 [project.optional-dependencies]
