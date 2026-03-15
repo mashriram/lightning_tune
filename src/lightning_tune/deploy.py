@@ -13,6 +13,7 @@ try:
     VLLM_AVAILABLE = True
 except ImportError:
     VLLM_AVAILABLE = False
+    LoRARequest = None # Avoid NameError if VLLMAPI is instantiated but setup not called
 
 
 class TextLLMAPI(LitAPI):
