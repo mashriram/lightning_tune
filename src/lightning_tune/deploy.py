@@ -1,4 +1,4 @@
-import torch, base64, io
+import torch, base64, io, logging
 from pathlib import Path
 from litserve import LitAPI, LitServer
 from PIL import Image
@@ -16,39 +16,37 @@ except ImportError:
 
 
 class TextLLMAPI(LitAPI):
-    def __init__(self, adapter_path: Path, config: PipelineConfig):
-        self.adapter_path = adapter_path
+    def __init__(self, base_adapter_path: Path, config: PipelineConfig):
+        self.base_adapter_path = base_adapter_path
         self.config = config
+        self.adapters_cached = {}
 
     def setup(self, device):
         # Determine model class
         hf_config = AutoConfig.from_pretrained(self.config.model.repo_id, trust_remote_code=True)
-        # Check if vision model (Native VLM used as text generator?)
-        # Or just standard CausalLM.
-        # For robustness, try AutoModelForCausalLM first as SFTTrainer uses it.
+        self.torch_dtype = torch.bfloat16 if device == "cuda" else torch.float32
+        
         try:
-            base_model = AutoModelForCausalLM.from_pretrained(
+            self.base_model = AutoModelForCausalLM.from_pretrained(
                 self.config.model.repo_id,
                 return_dict=True,
-                torch_dtype=torch.bfloat16,
+                torch_dtype=self.torch_dtype,
                 cache_dir=self.config.model.base_model_dir,
                 trust_remote_code=True
-            )
+            ).to(device)
         except Exception:
-             # Fallback for some models
-             base_model = AutoModelForVision2Seq.from_pretrained(
+             self.base_model = AutoModelForVision2Seq.from_pretrained(
                 self.config.model.repo_id,
                 return_dict=True,
-                torch_dtype=torch.bfloat16,
+                torch_dtype=self.torch_dtype,
                 cache_dir=self.config.model.base_model_dir,
                 trust_remote_code=True
-            )
+            ).to(device)
 
-        self.model = (
-            PeftModel.from_pretrained(base_model, str(self.adapter_path))
-            .merge_and_unload()
-            .to(device)
-        )
+        # Initialize PeftModel with the base adapter
+        self.model = PeftModel.from_pretrained(self.base_model, str(self.base_adapter_path), adapter_name="default")
+        self.adapters_cached["default"] = str(self.base_adapter_path)
+        
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.config.model.repo_id,
             cache_dir=self.config.model.base_model_dir,
@@ -56,14 +54,26 @@ class TextLLMAPI(LitAPI):
         )
 
     def decode_request(self, r: dict):
-        # Support simple chat format or raw prompt
         prompt = r.get("prompt", "")
-        # If messages list is passed (chat), apply template?
-        # For now assume raw prompt or simple text.
-        return self.tokenizer(prompt, return_tensors="pt").to(self.device)
+        adapter_path = r.get("adapter_path")
+        return {
+            "input_ids": self.tokenizer(prompt, return_tensors="pt").input_ids.to(self.device),
+            "adapter_path": adapter_path
+        }
 
     @torch.inference_mode()
     def predict(self, x):
+        adapter_path = x.get("adapter_path")
+        if adapter_path and adapter_path != self.adapters_cached.get(self.model.active_adapter):
+             # Switch or load adapter
+             name = Path(adapter_path).name
+             if name not in self.model.peft_config:
+                  logging.getLogger("deploy").info(f"Loading new adapter: {name} from {adapter_path}")
+                  self.model.load_adapter(str(adapter_path), adapter_name=name)
+                  self.adapters_cached[name] = str(adapter_path)
+             self.model.set_adapter(name)
+             logging.getLogger("deploy").info(f"Switched to adapter: {name}")
+
         outputs = self.model.generate(input_ids=x["input_ids"], max_new_tokens=100)
         return self.tokenizer.batch_decode(outputs, skip_special_tokens=True)[0]
 
@@ -72,50 +82,52 @@ class TextLLMAPI(LitAPI):
 
 
 class VLLMAPI(LitAPI):
-    def __init__(self, adapter_path: Path, config: PipelineConfig):
-        self.adapter_path = adapter_path
+    def __init__(self, base_adapter_path: Path, config: PipelineConfig):
+        self.base_adapter_path = base_adapter_path
         self.config = config
-        self.lora_request = None
+        self.lora_requests = {}
 
     def setup(self, device):
         if not VLLM_AVAILABLE:
             raise ImportError("vLLM is not installed. Please install it with `pip install vllm`.")
         
-        # Initialize vLLM
-        # Enable LoRA if adapter is present
         self.llm_engine = LLM(
             model=str(self.config.model.repo_id),
             enable_lora=True,
-            max_lora_rank=64, # Default max
+            max_lora_rank=64,
             trust_remote_code=True,
-            gpu_memory_utilization=0.8
-            # device is handled by vLLM (uses CUDA_VISIBLE_DEVICES or internal logic)
+            gpu_memory_utilization=0.7
         )
         
-        # Define LoRA request
-        # We assign a unique ID (e.g., 1) and give it a name
-        adapter_name = self.adapter_path.name
-        self.lora_request = LoRARequest(adapter_name, 1, str(self.adapter_path))
-        
+        # Initial LoRA
+        name = self.base_adapter_path.name
+        self.lora_requests["default"] = LoRARequest("default", 1, str(self.base_adapter_path))
         self.sampling_params = SamplingParams(temperature=0.7, max_tokens=100)
 
     def decode_request(self, r: dict):
-        return r.get("prompt", "")
+        return {
+            "prompt": r.get("prompt", ""),
+            "adapter_path": r.get("adapter_path")
+        }
 
     def predict(self, x):
-        # x is a list of prompts (batch) from LitServe if batched, or single
-        # LitServe usually passes batched inputs to predict if batching is enabled.
-        # But here let's assume simple handling.
+        prompt = x["prompt"]
+        adapter_path = x.get("adapter_path")
         
-        # vLLM generate expects list of prompts
-        prompts = x if isinstance(x, list) else [x]
-        
+        lora_req = self.lora_requests["default"]
+        if adapter_path:
+             name = Path(adapter_path).name
+             if name not in self.lora_requests:
+                  idx = len(self.lora_requests) + 1
+                  self.lora_requests[name] = LoRARequest(name, idx, str(adapter_path))
+             lora_req = self.lora_requests[name]
+
         outputs = self.llm_engine.generate(
-            prompts,
+            [prompt],
             self.sampling_params,
-            lora_request=self.lora_request
+            lora_request=lora_req
         )
-        return [o.outputs[0].text for o in outputs]
+        return outputs[0].outputs[0].text
 
     def encode_response(self, output) -> dict:
         # output is list of strings
@@ -242,9 +254,9 @@ def launch_server(config: PipelineConfig, trained_artifact_path: Path):
         # logic: if generic LLM, prefer vLLM if installed AND requested (default True)
         if VLLM_AVAILABLE and config.deployment.use_vllm:
              print("⚡ Using vLLM for high-performance serving ⚡")
-             api = VLLMAPI(adapter_path=trained_artifact_path, config=config)
+             api = VLLMAPI(base_adapter_path=trained_artifact_path, config=config)
         else:
-             api = TextLLMAPI(adapter_path=trained_artifact_path, config=config)
+             api = TextLLMAPI(base_adapter_path=trained_artifact_path, config=config)
 
     if config.trainer.device == "cuda":
         api.model = torch.compile(api.model)

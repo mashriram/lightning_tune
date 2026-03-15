@@ -123,6 +123,28 @@ def start_serve_api(job_id, port, use_vllm, token):
         gr.Error(f"Connection error: {e}")
         return None
 
+def start_tune_api(config, trials, token):
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    payload = {"config": config, "n_trials": int(trials)}
+    try:
+        resp = requests.post(f"{API_URL}/tune", json=payload, headers=headers)
+        if resp.status_code == 200:
+            return resp.json()["job_id"]
+        gr.Error(f"Tuning start failed: {resp.text}")
+        return None
+    except Exception as e:
+        gr.Error(f"Connection error: {e}")
+        return None
+
+def get_adapters_api():
+    try:
+        resp = requests.get(f"{API_URL}/adapters")
+        if resp.status_code == 200:
+            return resp.json()
+        return []
+    except:
+        return []
+
 def push_to_hub_api(job_id, hub_id, private, token):
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     payload = {"job_id": job_id, "hub_model_id": hub_id, "private": private}
@@ -284,9 +306,12 @@ with gr.Blocks(title="Lightning Tune Pro") as app:
             hub_model_id = gr.Textbox(label="Hub Model ID (username/repo)")
 
         with gr.Row():
-            train_btn = gr.Button("Start Training", variant="primary")
+            train_btn = gr.Button("🚀 Start Training", variant="primary")
+            tune_btn = gr.Button("🔬 Optimize Hyperparams (Tune)", variant="secondary")
             stop_btn = gr.Button("Stop Job", variant="stop")
         
+        n_trials_sl = gr.Slider(label="Max Tuning Trials", minimum=1, maximum=50, value=5, step=1)
+
         with gr.Row():
             job_id_display = gr.Textbox(label="Job ID", interactive=False)
             status_display = gr.Textbox(label="Job Status", interactive=False, value="Idle")
@@ -304,6 +329,18 @@ with gr.Blocks(title="Lightning Tune Pro") as app:
 
         train_btn.click(start_training_wrapper, inputs=[final_config, push_check, hub_model_id, hf_token],
                         outputs=[job_id_display, status_display])
+
+        def start_tuning_wrapper(cfg, trials, tok):
+            if not cfg:
+                gr.Warning("No config generated! Please analyze a dataset first.")
+                return None, "Failed (No Config)"
+            jid = start_tune_api(cfg, trials, tok)
+            if jid:
+                return jid, "Tuning (Running)"
+            return None, "Failed (API Error)"
+
+        tune_btn.click(start_tuning_wrapper, inputs=[final_config, n_trials_sl, hf_token],
+                       outputs=[job_id_display, status_display])
 
         # Stop Button
         stop_btn.click(stop_job_api, inputs=[job_id_display, hf_token], outputs=[status_display])
@@ -353,17 +390,31 @@ with gr.Blocks(title="Lightning Tune Pro") as app:
 
         serve_btn.click(start_serve_api, inputs=[job_id_display, serve_port, use_vllm_chk, hf_token], outputs=service_url_display)
 
-        chatbot = gr.Chatbot()
+        with gr.Row():
+            adapter_dd = gr.Dropdown(label="Select Active Adapter", choices=["default"])
+            refresh_adapters_btn = gr.Button("🔄 Refresh Adapters", scale=0)
+        
+        def refresh_adapters():
+             ads = get_adapters_api()
+             choices = [("Default", "default")] + [(a["name"], a["path"]) for a in ads]
+             return gr.update(choices=choices)
+        
+        refresh_adapters_btn.click(refresh_adapters, outputs=adapter_dd)
+
+        chatbot = gr.Chatbot(bubble_full_width=False, height=500)
         with gr.Row():
              msg = gr.Textbox(label="Message")
              audio_input = gr.Audio(sources=["upload", "microphone"], type="filepath", label="Audio Input (Optional)")
         clear = gr.Button("Clear")
 
-        def chat_fn(message, audio_path, history, url):
+        def chat_fn(message, audio_path, history, url, adapter_path):
             if not url:
                 return history + [[message, "Server not connected."]]
             
             payload = {"prompt": message}
+            if adapter_path and adapter_path != "default":
+                 payload["adapter_path"] = adapter_path
+
             if audio_path:
                 try:
                     with open(audio_path, "rb") as f:
@@ -386,7 +437,7 @@ with gr.Blocks(title="Lightning Tune Pro") as app:
                 history.append((message, f"Exception: {e}"))
                 return history
 
-        msg.submit(chat_fn, inputs=[msg, audio_input, chatbot, service_url_display], outputs=chatbot)
+        msg.submit(chat_fn, inputs=[msg, audio_input, chatbot, service_url_display, adapter_dd], outputs=chatbot)
         clear.click(lambda: None, None, chatbot, queue=False)
 
 if __name__ == "__main__":

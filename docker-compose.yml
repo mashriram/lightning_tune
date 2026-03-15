@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./jobs:/app/jobs
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    environment:
+      - HF_TOKEN=${HF_TOKEN}
+    restart: always
+
+  ui:
+    build: .
+    ports:
+      - "7860:7860"
+    environment:
+      - LIGHTNING_TUNE_API_URL=http://api:8000
+    command: ["python", "app/new_gradio_app.py"]
+    depends_on:
+      - api
+    restart: always

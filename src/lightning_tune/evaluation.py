@@ -6,7 +6,7 @@ from .deploy import TextLLMAPI
 
 def run_evaluation(config: PipelineConfig, model_path: str):
     # Load the model
-    api = TextLLMAPI(adapter_path=model_path, config=config)
+    api = TextLLMAPI(base_adapter_path=model_path, config=config)
     api.setup("cpu")
 
     # Load the dataset
@@ -14,7 +14,14 @@ def run_evaluation(config: PipelineConfig, model_path: str):
     references = [example[config.data.output_column] for example in dataset["test"]]
 
     # Generate predictions
-    predictions = [api.predict(api.decode_request({"prompt": example[config.data.instruction_column]})) for example in dataset["test"]]
+    predictions = []
+    for example in dataset["test"]:
+        prompt = example.get("instruction_prompt")
+        if not prompt:
+             prompt = api.decode_request({"prompt": example.get(config.data.instruction_column, "")})
+        else:
+             prompt = api.decode_request({"prompt": prompt})
+        predictions.append(api.predict(prompt))
 
     # Compute the metrics
     rouge = evaluate.load("rouge")

@@ -103,7 +103,7 @@ class DataConfig(BaseModel):
                      image_root_path=self.image_root_path
                  ))
              else:
-                 pass # Might be valid if we are initializing empty? Or error.
+                 raise ValueError("DataConfig must have at least one data source (file_path, dataset_repo_id, db_uri, or datasets list)")
         return self
 
 
@@ -200,7 +200,7 @@ class PipelineConfig(BaseModel):
             # If low cardinality and short strings, it's likely categorical
             if any(c in l_col for c in common_text_cols):
                 analysis["text_columns"].append(col)
-            elif df_sample[col].n_unique() < 50 and avg_str_len < 30:
+            elif df_sample[col].n_unique() < 50 and (avg_str_len is not None and avg_str_len < 30):
                 analysis["categorical_columns"].append(col)
             else:
                 analysis["text_columns"].append(col)

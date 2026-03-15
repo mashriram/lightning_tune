@@ -68,7 +68,8 @@ class TestRealE2EPipeline(unittest.TestCase):
         config.trainer.devices = 1
         config.trainer.accelerator = "auto"
 
-        output_path = run_finetuning(config)
+        result = run_finetuning(config)
+        output_path = result["path"]
         
         self.assertTrue(output_path.exists())
         self.assertTrue((output_path / "adapter_model.safetensors").exists())
@@ -97,7 +98,8 @@ class TestRealE2EPipeline(unittest.TestCase):
         config.trainer.limit_val_batches = 0
         config.trainer.max_epochs = 1
         
-        output_path = run_finetuning(config)
+        result = run_finetuning(config)
+        output_path = result["path"]
         self.assertTrue(output_path.exists())
 
     def test_multimodal_audio(self):
@@ -123,7 +125,8 @@ class TestRealE2EPipeline(unittest.TestCase):
         config.trainer.limit_val_batches = 0
         config.trainer.max_epochs = 1
         
-        output_path = run_finetuning(config)
+        result = run_finetuning(config)
+        output_path = result["path"]
         self.assertTrue(output_path.exists())
 
 if __name__ == "__main__":

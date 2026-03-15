@@ -140,6 +140,34 @@ def stop_job_endpoint(job_id: str, token: Optional[str] = Depends(get_token)):
     else:
         raise HTTPException(status_code=404, detail="Job not found or not running.")
 
+@app.post("/tune", response_model=JobResponse)
+def start_tune(request: TrainRequest, n_trials: int = 10, token: Optional[str] = Depends(get_token)):
+    """
+    Start a hyperparameter tuning job.
+    """
+    try:
+        job_id = job_manager.start_tuning_job(request.config, n_trials, token)
+        return JobResponse(job_id=job_id, status="running", output_dir=f"jobs/{job_id}")
+    except Exception as e:
+        logger.error(f"Failed to start tuning: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/adapters")
+def list_adapters():
+    """
+    List all available fine-tuned adapters (finished jobs).
+    """
+    adapters = []
+    if not Path("jobs").exists():
+        return []
+    for job_dir in Path("jobs").iterdir():
+        if job_dir.is_dir():
+            if (job_dir / "final_adapter").exists():
+                adapters.append({"name": job_dir.name, "path": str((job_dir / "final_adapter").absolute())})
+            elif (job_dir / "best_model.ckpt").exists():
+                adapters.append({"name": job_dir.name, "path": str(job_dir.absolute())})
+    return adapters
+
 @app.post("/serve", response_model=JobResponse)
 def serve_model(request: ServeRequest, token: Optional[str] = Depends(get_token)):
     """

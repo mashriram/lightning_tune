@@ -15,6 +15,7 @@ from transformers import (
     BitsAndBytesConfig,
     AutoConfig
 )
+from typing import Dict, Union, Any, Iterator, List, Optional
 from peft import LoraConfig, PeftModel
 from trl import SFTTrainer
 from pathlib import Path
@@ -22,7 +23,7 @@ import copy
 from huggingface_hub import HfApi
 
 
-def _run_text_finetuning_pipeline(config: PipelineConfig) -> Path:
+def _run_text_finetuning_pipeline(config: PipelineConfig) -> Dict[str, Any]:
     if config.train.peft.method == "qlora" and config.trainer.device != "cuda":
         warnings.warn(
             "QLoRA is only available on CUDA devices. Falling back to LoRA."
@@ -116,10 +117,10 @@ def _run_text_finetuning_pipeline(config: PipelineConfig) -> Path:
          logging.info(f"Pushed to hub: {config.train.hub_model_id}")
 
     logging.info(f"--- Finetuning Complete. Adapter saved to: {final_adapter_path} ---")
-    return final_adapter_path
+    return {"path": final_adapter_path, "metrics": metrics if 'metrics' in locals() else {}}
 
 
-def _run_multimodal_pipeline(config: PipelineConfig) -> Path:
+def _run_multimodal_pipeline(config: PipelineConfig) -> Dict[str, Any]:
     logging.info("--- Starting Multi-Modal Finetuning ---")
     output_dir = config.get_output_dir()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -301,10 +302,13 @@ def _run_multimodal_pipeline(config: PipelineConfig) -> Path:
             logging.error(f"Failed to push to hub: {e}")
 
     logging.info(f"--- Multi-Modal Finetuning Complete. Best model saved to: {best_path} ---")
-    return best_path
+    metrics = trainer.callback_metrics
+    # Convert tensor metrics to float
+    metrics = {k: v.item() if hasattr(v, "item") else v for k, v in metrics.items()}
+    return {"path": best_path, "metrics": metrics}
 
 
-def run_finetuning(config: PipelineConfig) -> Path:
+def run_finetuning(config: PipelineConfig) -> Dict[str, Any]:
     torch.set_float32_matmul_precision("high")
     if config.is_multimodal:
         return _run_multimodal_pipeline(config)

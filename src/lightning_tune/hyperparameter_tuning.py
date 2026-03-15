@@ -1,4 +1,5 @@
 import optuna
+import logging
 from .config import PipelineConfig
 from .train import run_finetuning
 
@@ -9,28 +10,41 @@ def _objective(trial, config: PipelineConfig):
     config.train.peft.lora_alpha = trial.suggest_int("lora_alpha", 8, 64, step=8)
 
     # Run the finetuning process
-    trainer = run_finetuning(config)
+    result = run_finetuning(config)
+    metrics = result.get("metrics", {})
 
-    # Return the validation loss
-    if hasattr(trainer, "state") and hasattr(trainer.state, "best_metric"):
-        return trainer.state.best_metric
+    # Return the validation loss (SFTTrainer uses 'eval_loss', MultiModal uses 'val_loss')
+    val_loss = metrics.get("eval_loss") or metrics.get("val_loss")
+    
+    if val_loss is not None:
+        return val_loss
     else:
-        # If the trainer does not have a state attribute, it means that the
-        # training was not successful. In this case, we return a large value
-        # to indicate that this trial should be pruned.
+        # If no loss found, return inf to indicate failure/unoptimal
+        logging.warning("No evaluation loss found in metrics. Trial marked as infinity.")
         return float("inf")
 
 def run_hyperparameter_tuning(config: PipelineConfig, n_trials: int = 10):
-    study = optuna.create_study(direction="minimize")
+    sampler = optuna.samplers.TPESampler(seed=42)
+    pruner = optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=10)
+    
+    study = optuna.create_study(direction="minimize", sampler=sampler, pruner=pruner)
     study.optimize(lambda trial: _objective(trial, config), n_trials=n_trials)
 
-    print("Number of finished trials: ", len(study.trials))
-    print("Best trial:")
+    logging.info(f"HPT Finished. Number of trials: {len(study.trials)}")
+    if not study.trials:
+        logging.warning("No trials completed. Config remains unchanged.")
+        return config
+
     trial = study.best_trial
-
-    print("  Value: ", trial.value)
-    print("  Params: ")
-    for key, value in trial.params.items():
-        print(f"    {key}: {value}")
-
-    # TODO: Save the best hyperparameters to a file
+    logging.info(f"Best Trial Value: {trial.value}")
+    
+    # Update the config with the best hyperparameters
+    if "llm_lr" in trial.params:
+        config.train.llm_lr = trial.params["llm_lr"]
+    if "r" in trial.params:
+        config.train.peft.r = trial.params["r"]
+    if "lora_alpha" in trial.params:
+        config.train.peft.lora_alpha = trial.params["lora_alpha"]
+    
+    logging.info(f"Updated config with best params: {trial.params}")
+    return config

@@ -15,53 +15,60 @@ import torchaudio
 from torchaudio.transforms import Resample
 
 def prepare_text_dataset(config: PipelineConfig) -> DatasetDict:
-    def format_prompt(example):
-        if config.data.input_column and example.get(config.data.input_column):
-            return {
-                "text": f"### Instruction:\n{example.get(config.data.instruction_column, '')}\n\n### Input:\n{example.get(config.data.input_column, '')}\n\n### Response:\n{example.get(config.data.output_column, '')}"
-            }
-        return {
-            "text": f"### Instruction:\n{example.get(config.data.instruction_column, '')}\n\n### Response:\n{example.get(config.data.output_column, '')}"
-        }
+    def format_prompt_for_dataset(ds_config, global_config):
+        # Create a closure mapping tied to individual dataset configurations
+        # Fall back to global configuration if the local dataset config lacks necessary definitions.
+        input_col = getattr(ds_config, "input_column", None) or getattr(global_config, "input_column", None)
+        instr_col = getattr(ds_config, "instruction_column", None) or getattr(global_config, "instruction_column", None)
+        out_col = getattr(ds_config, "output_column", None) or getattr(global_config, "output_column", None)
+
+        def _format(example):
+            i_txt = str(example.get(instr_col, '')) if instr_col in example else ''
+            in_txt = str(example.get(input_col, '')) if input_col and input_col in example else ''
+            o_txt = str(example.get(out_col, '')) if out_col in example else ''
+            
+            prompt = f"### Instruction:\n{i_txt}\n\n### Input:\n{in_txt}\n\n### Response:\n" if in_txt else f"### Instruction:\n{i_txt}\n\n### Response:\n"
+            full_text = prompt + o_txt
+            
+            res = dict(example)
+            res["text"] = full_text
+            res["instruction_prompt"] = prompt # Useful for evaluation
+            return res
+        return _format
 
     datasets_list = []
     
     # Process multiple datasets
     sources = config.data.datasets if config.data.datasets else []
     # legacy fallback handled during config consolidation, but just in case
-    if not sources:
-         pass
+    all_items = []
              
     for src in sources:
+        formatter = format_prompt_for_dataset(src, config.data)
+        
         if src.repo_id:
             logging.info(f"Loading dataset from HF: {src.repo_id}")
             ds = load_dataset(src.repo_id, name=src.config_name, split=src.split or "train")
-            ds = ds.map(format_prompt)
-            datasets_list.append(ds)
+            all_items.extend([formatter(x) for x in ds])
         elif src.file_path:
             file_path = Path(src.file_path)
             file_type = file_path.suffix.lower().replace(".", "")
             ds = load_dataset(file_type, data_files=str(file_path), split="train")
-            ds = ds.map(format_prompt)
-            datasets_list.append(ds)
+            all_items.extend([formatter(x) for x in ds])
         elif src.db_uri:
              import polars as pl
-             import pyarrow as pa
+             import pandas as pd
              from datasets import Dataset as HFDataset
              logging.info(f"Loading dataset from DB: {src.db_uri}")
              df = pl.read_database_uri(query=src.db_query, uri=src.db_uri, engine="connectorx")
-             ds = HFDataset(pa.Table.from_batches(df.to_arrow().to_batches()))
-             ds = ds.map(format_prompt)
-             datasets_list.append(ds)
+             ds = HFDataset.from_pandas(df.to_pandas())
+             all_items.extend([formatter(x) for x in ds])
 
-    if not datasets_list:
+    if not all_items:
         raise ValueError("No datasets could be loaded for text finetuning.")
-        
-    from datasets import concatenate_datasets
-    if len(datasets_list) > 1:
-        dataset = concatenate_datasets(datasets_list)
-    else:
-        dataset = datasets_list[0]
+
+    from datasets import Dataset as HFDataset
+    dataset = HFDataset.from_list(all_items)
     
     if config.trainer.evaluation.do_eval and config.trainer.evaluation.eval_dataset_size > 0:
          return dataset.train_test_split(test_size=config.trainer.evaluation.eval_dataset_size)

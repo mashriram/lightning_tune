@@ -57,7 +57,8 @@ class TestTabularPipeline(unittest.TestCase):
         config.trainer.limit_val_batches = 0
         config.trainer.max_epochs = 1
         
-        output_path = run_finetuning(config)
+        result = run_finetuning(config)
+        output_path = result["path"]
         self.assertTrue(output_path.exists())
         self.assertTrue((output_path / "towers.pt").exists()) # Verify towers saved
         self.assertTrue((output_path / "adapter_model.safetensors").exists()) # Verify adapter saved (HF format)

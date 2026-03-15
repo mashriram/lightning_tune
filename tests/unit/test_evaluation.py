@@ -28,7 +28,8 @@ def test_evaluation(tmp_path):
     # Run finetuning to get a model adapter
     config.trainer.max_epochs = 1
     config.trainer.evaluation.do_eval = True
-    adapter_path = lt.run_finetuning(config)
+    result = lt.run_finetuning(config)
+    adapter_path = result["path"]
 
     with patch("lightning_tune.evaluation.evaluate.load") as mock_load:
         lt.run_evaluation(config, str(adapter_path))

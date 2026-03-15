@@ -53,6 +53,39 @@ class JobManager:
         self.active_jobs[job_id] = process
         return job_id
 
+    def start_tuning_job(self, config_dict: Dict[str, Any], n_trials: int = 10, hf_token: Optional[str] = None) -> str:
+        job_id = str(uuid.uuid4())
+        job_dir = JOBS_DIR / job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+
+        config_path = job_dir / "config.yaml"
+        with open(config_path, "w") as f:
+            yaml.dump(config_dict, f)
+
+        log_path = job_dir / "tune.log"
+        log_file = open(log_path, "w")
+
+        env = os.environ.copy()
+        if hf_token:
+            env["HF_TOKEN"] = hf_token
+            env["HUGGING_FACE_HUB_TOKEN"] = hf_token
+
+        cmd = ["python", "-m", "lightning_tune.cli", "tune", str(config_path), "--n-trials", str(n_trials)]
+
+        logger.info(f"Starting tuning job {job_id} with cmd: {cmd}")
+
+        process = subprocess.Popen(
+            cmd,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            env=env,
+            cwd=os.getcwd()
+        )
+        log_file.close()
+
+        self.active_jobs[job_id] = process
+        return job_id
+
     def start_serving_job(self, job_id: Optional[str], model_path: Optional[str], config: Optional[Dict], port: int, use_vllm: bool, hf_token: Optional[str]) -> str:
         service_id = str(uuid.uuid4())
         service_dir = JOBS_DIR / f"service_{service_id}"
