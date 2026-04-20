@@ -22,6 +22,8 @@ dependencies = [
     "litgpt",
     "lightning[all]",
     "litserve",
+    "mlflow",
+    "pynvml",
     "gradio",
     "streamlit",
     "optuna",

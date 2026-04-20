@@ -31,7 +31,7 @@ def prepare_text_dataset(config: PipelineConfig) -> DatasetDict:
             full_text = prompt + o_txt
             
             res = dict(example)
-            res["text"] = full_text
+            res["completion"] = full_text
             res["instruction_prompt"] = prompt # Useful for evaluation
             return res
         return _format

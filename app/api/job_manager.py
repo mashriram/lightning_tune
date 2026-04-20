@@ -1,6 +1,8 @@
 import subprocess
 import uuid
 import os
+import sys
+import os
 from pathlib import Path
 from typing import Dict, Any, Optional, AsyncGenerator
 import asyncio
@@ -35,7 +37,7 @@ class JobManager:
             env["HF_TOKEN"] = hf_token
             env["HUGGING_FACE_HUB_TOKEN"] = hf_token
 
-        cmd = ["python", "-m", "lightning_tune.cli", "train", str(config_path)]
+        cmd = [sys.executable, "-m", "lightning_tune.cli", "train", str(config_path)]
 
         logger.info(f"Starting job {job_id} with cmd: {cmd}")
 
@@ -70,7 +72,7 @@ class JobManager:
             env["HF_TOKEN"] = hf_token
             env["HUGGING_FACE_HUB_TOKEN"] = hf_token
 
-        cmd = ["python", "-m", "lightning_tune.cli", "tune", str(config_path), "--n-trials", str(n_trials)]
+        cmd = [sys.executable, "-m", "lightning_tune.cli", "tune", str(config_path), "--n-trials", str(n_trials)]
 
         logger.info(f"Starting tuning job {job_id} with cmd: {cmd}")
 
@@ -112,7 +114,7 @@ class JobManager:
         if model_path:
             mdl_path = Path(model_path)
 
-        if config:
+        if config is not None:
             base_cfg = {}
             if cfg_path:
                 with open(cfg_path, "r") as f:
@@ -125,14 +127,25 @@ class JobManager:
                 yaml.dump(base_cfg, f)
 
         if not cfg_path or not cfg_path.exists():
-            raise ValueError("Configuration not found. Please provide config or valid job_id.")
+            cfg_path = service_dir / "user_config.yaml"
+            with open(cfg_path, "w") as f:
+                yaml.dump({"model": {"name": str(mdl_path)}}, f)
 
-        if not mdl_path or not mdl_path.exists():
-            raise ValueError("Model artifact not found. Please provide model_path or valid job_id with artifacts.")
+        is_hub_id = mdl_path and "/" in str(mdl_path)
+        if not mdl_path or (not mdl_path.exists() and not is_hub_id):
+            raise ValueError("Model artifact not found locally and does not resemble a valid Hub ID. Please provide model_path or valid job_id with artifacts.")
 
         # Update port in config
         with open(cfg_path, "r") as f:
-            final_cfg = yaml.safe_load(f)
+            final_cfg = yaml.safe_load(f) or {}
+
+        if "model" not in final_cfg:
+            final_cfg["model"] = {"repo_id": str(mdl_path)}
+        elif "name" in final_cfg["model"]:
+            final_cfg["model"]["repo_id"] = final_cfg["model"].pop("name")
+            
+        if "data" not in final_cfg:
+            final_cfg["data"] = {"dataset_repo_id": "dummy/minimal"}
 
         if "deployment" not in final_cfg:
             final_cfg["deployment"] = {}
@@ -151,7 +164,7 @@ class JobManager:
             env["HF_TOKEN"] = hf_token
             env["HUGGING_FACE_HUB_TOKEN"] = hf_token
 
-        cmd = ["python", "-m", "lightning_tune.cli", "serve", str(final_cfg_path), str(mdl_path)]
+        cmd = [sys.executable, "-m", "lightning_tune.cli", "serve", str(final_cfg_path), str(mdl_path)]
 
         logger.info(f"Starting service {service_id} on port {port}")
 

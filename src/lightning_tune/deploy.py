@@ -1,4 +1,4 @@
-import torch, base64, io, logging
+import torch, base64, io, logging, os
 from pathlib import Path
 from litserve import LitAPI, LitServer
 from PIL import Image
@@ -18,47 +18,66 @@ except ImportError:
 
 class TextLLMAPI(LitAPI):
     def __init__(self, base_adapter_path: Path, config: PipelineConfig):
+        super().__init__()
         self.base_adapter_path = base_adapter_path
         self.config = config
         self.adapters_cached = {}
 
     def setup(self, device):
-        # Determine model class
-        hf_config = AutoConfig.from_pretrained(self.config.model.repo_id, trust_remote_code=True)
-        self.torch_dtype = torch.bfloat16 if device == "cuda" else torch.float32
-        
         try:
-            self.base_model = AutoModelForCausalLM.from_pretrained(
-                self.config.model.repo_id,
-                return_dict=True,
-                torch_dtype=self.torch_dtype,
-                cache_dir=self.config.model.base_model_dir,
-                trust_remote_code=True
-            ).to(device)
-        except Exception:
-             self.base_model = AutoModelForVision2Seq.from_pretrained(
-                self.config.model.repo_id,
-                return_dict=True,
-                torch_dtype=self.torch_dtype,
-                cache_dir=self.config.model.base_model_dir,
-                trust_remote_code=True
-            ).to(device)
+            # Determine model class
+            token = os.getenv("HF_TOKEN")
+            hf_config = AutoConfig.from_pretrained(self.config.model.repo_id, trust_remote_code=True, token=token)
+            self.torch_dtype = torch.bfloat16 if device == "cuda" else torch.float32
+            
+            try:
+                self.base_model = AutoModelForCausalLM.from_pretrained(
+                    self.config.model.repo_id,
+                    return_dict=True,
+                    torch_dtype=self.torch_dtype,
+                    cache_dir=self.config.model.base_model_dir,
+                    trust_remote_code=True,
+                    token=token
+                ).to(device)
+            except Exception:
+                 self.base_model = AutoModelForVision2Seq.from_pretrained(
+                    self.config.model.repo_id,
+                    return_dict=True,
+                    torch_dtype=self.torch_dtype,
+                    cache_dir=self.config.model.base_model_dir,
+                    trust_remote_code=True,
+                    token=token
+                ).to(device)
 
-        # Initialize PeftModel with the base adapter
-        self.model = PeftModel.from_pretrained(self.base_model, str(self.base_adapter_path), adapter_name="default")
-        self.adapters_cached["default"] = str(self.base_adapter_path)
-        
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.config.model.repo_id,
-            cache_dir=self.config.model.base_model_dir,
-            trust_remote_code=True
-        )
+            # Initialize PeftModel with the base adapter
+            if self.base_adapter_path and self.base_adapter_path.exists() and (self.base_adapter_path / "adapter_config.json").exists():
+                 self.model = PeftModel.from_pretrained(
+                    self.base_model, 
+                    str(self.base_adapter_path), 
+                    adapter_name="default",
+                    token=token
+                 )
+            else:
+                 # No adapter, just use base model
+                 self.model = self.base_model
 
-    def decode_request(self, r: dict):
-        prompt = r.get("prompt", "")
-        adapter_path = r.get("adapter_path")
+            self.adapters_cached["default"] = str(self.base_adapter_path)
+            
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.config.model.repo_id,
+                cache_dir=self.config.model.base_model_dir,
+                trust_remote_code=True,
+                token=token
+            )
+        except Exception as e:
+            logging.getLogger("deploy").error(f"FATAL: Worker setup failed: {e}", exc_info=True)
+            raise e
+
+    def decode_request(self, request: dict):
+        prompt = request.get("prompt", "")
+        adapter_path = request.get("adapter_path")
         return {
-            "input_ids": self.tokenizer(prompt, return_tensors="pt").input_ids.to(self.device),
+            "input_ids": self.tokenizer(prompt, return_tensors="pt").input_ids,
             "adapter_path": adapter_path
         }
 
@@ -75,7 +94,8 @@ class TextLLMAPI(LitAPI):
              self.model.set_adapter(name)
              logging.getLogger("deploy").info(f"Switched to adapter: {name}")
 
-        outputs = self.model.generate(input_ids=x["input_ids"], max_new_tokens=100)
+        input_ids = x["input_ids"].to(self.device)
+        outputs = self.model.generate(input_ids=input_ids, max_new_tokens=100)
         return self.tokenizer.batch_decode(outputs, skip_special_tokens=True)[0]
 
     def encode_response(self, text) -> dict:
@@ -84,6 +104,7 @@ class TextLLMAPI(LitAPI):
 
 class VLLMAPI(LitAPI):
     def __init__(self, base_adapter_path: Path, config: PipelineConfig):
+        super().__init__()
         self.base_adapter_path = base_adapter_path
         self.config = config
         self.lora_requests = {}
@@ -101,14 +122,19 @@ class VLLMAPI(LitAPI):
         )
         
         # Initial LoRA
-        name = self.base_adapter_path.name
-        self.lora_requests["default"] = LoRARequest("default", 1, str(self.base_adapter_path))
+        if self.base_adapter_path and self.base_adapter_path.exists() and (self.base_adapter_path / "adapter_config.json").exists():
+            name = self.base_adapter_path.name
+            self.lora_requests["default"] = LoRARequest("default", 1, str(self.base_adapter_path))
+            lora_req = self.lora_requests["default"]
+        else:
+            lora_req = None # Base model only
+        
         self.sampling_params = SamplingParams(temperature=0.7, max_tokens=100)
 
-    def decode_request(self, r: dict):
+    def decode_request(self, request: dict):
         return {
-            "prompt": r.get("prompt", ""),
-            "adapter_path": r.get("adapter_path")
+            "prompt": request.get("prompt", ""),
+            "adapter_path": request.get("adapter_path")
         }
 
     def predict(self, x):
@@ -146,9 +172,16 @@ class VLLMAPI(LitAPI):
 
 class MultiModalAPI(LitAPI):
     def __init__(self, checkpoint_path: Path):
+        super().__init__()
         self.checkpoint_path = checkpoint_path
 
     def setup(self, device):
+        if not self.checkpoint_path or not self.checkpoint_path.exists():
+            # If no checkpoint, we can't really do much for MultiModal, 
+            # but we'll log it and raise a better error
+            logging.getLogger("deploy").error(f"Checkpoint path {self.checkpoint_path} not found.")
+            raise FileNotFoundError(f"Checkpoint {self.checkpoint_path} is required for MultiModalAPI")
+
         # Load from checkpoint will invoke MultimodalLLM.__init__ which handles native VLM detection
         self.model = MultimodalLLM.load_from_checkpoint(
             self.checkpoint_path, map_location=device
@@ -181,7 +214,7 @@ class MultiModalAPI(LitAPI):
         item = {
             "input_ids": self.tokenizer.encode(
                 request["prompt"], return_tensors="pt"
-            ).to(self.device)
+            )
         }
         # Image
         if "image_b64" in request and self.config.data.vision_config:
@@ -189,7 +222,7 @@ class MultiModalAPI(LitAPI):
                 img_bytes = base64.b64decode(request["image_b64"])
                 img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
                 # Apply transform
-                item["image"] = self.image_transform(img).unsqueeze(0).to(self.device)
+                item["image"] = self.image_transform(img).unsqueeze(0)
             except Exception as e:
                 import logging
                 logging.getLogger("deploy").error(f"Image processing failed: {e}")
@@ -207,7 +240,7 @@ class MultiModalAPI(LitAPI):
                  if self.resample and sample_rate != 16000:
                      waveform = self.resample(waveform)
                  
-                 item["audio"] = waveform.mean(0).unsqueeze(0).to(self.device) # [1, T]
+                 item["audio"] = waveform.mean(0).unsqueeze(0) # [1, T]
              except Exception as e:
                  import logging
                  logging.getLogger("deploy").error(f"Audio processing failed: {e}")
@@ -216,23 +249,21 @@ class MultiModalAPI(LitAPI):
         if "tabular" in request and self.config.data.tabular_config and self.preprocessors:
             tc = self.config.data.tabular_config
             if tc.numerical_columns:
-                item["tabular_num"] = torch.tensor(
+                 item["tabular_num"] = torch.tensor(
                     self.preprocessors["scaler"].transform(
                         [[request["tabular"][c] for c in tc.numerical_columns]]
                     ),
-                    dtype=torch.float32,
-                    device=self.device,
+                    dtype=torch.float32
                 )
             if tc.categorical_columns:
-                item["tabular_cat"] = torch.tensor(
+                 item["tabular_cat"] = torch.tensor(
                     [
                         [
                             self.preprocessors["cat_mappings"][c][request["tabular"][c]]
                             for c in tc.categorical_columns
                         ]
                     ],
-                    dtype=torch.long,
-                    device=self.device,
+                    dtype=torch.long
                 )
 
         # Labels needed for forward? No, generate doesn't need labels.
@@ -240,7 +271,9 @@ class MultiModalAPI(LitAPI):
 
     @torch.inference_mode()
     def predict(self, batch):
-        return self.model.generate(batch, self.tokenizer, max_new_tokens=100)
+        # Move entire batch to device
+        device_batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+        return self.model.generate(device_batch, self.tokenizer, max_new_tokens=100)
 
     def encode_response(self, tokens) -> dict:
         text = self.tokenizer.batch_decode(tokens, skip_special_tokens=True)[0]
@@ -263,5 +296,5 @@ def launch_server(config: PipelineConfig, trained_artifact_path: Path):
         api.model = torch.compile(api.model)
 
     server = LitServer(api, accelerator="auto", devices=1)
-    print(f"\n🚀 Server launching on http://127.0.0.1:{config.deployment.port} 🚀\n")
-    server.run(port=config.deployment.port)
+    print(f"\n🚀 Server launching on http://0.0.0.0:{config.deployment.port} 🚀\n")
+    server.run(port=config.deployment.port, host="0.0.0.0")

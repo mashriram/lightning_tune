@@ -1,4 +1,4 @@
-import sys
+import sys, os
 from pathlib import Path
 
 # Add project root to sys.path to allow absolute imports
@@ -12,6 +12,7 @@ from typing import List, Optional, Union, Dict, Any
 import shutil
 import uuid
 import logging
+import threading
 
 # Use absolute imports
 from app.api.schemas import SearchResult, DatasetSearchResult, AnalyzeRequest, TrainRequest, JobResponse, ServeRequest, PushRequest
@@ -22,7 +23,61 @@ from src.lightning_tune.config import PipelineConfig
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("api")
 
+# ---------------------------------------------------------------------------
+# In-process inference cache (avoids LitServe subprocess complexity)
+# ---------------------------------------------------------------------------
+_inference_lock = threading.Lock()
+_loaded_pipeline = None   # transformers Pipeline instance
+_loaded_model_id = None   # which model is currently loaded
+
+
+def _get_or_load_pipeline(model_id: str):
+    """Load (or return cached) a transformers text-generation pipeline."""
+    global _loaded_pipeline, _loaded_model_id
+    if _loaded_pipeline is not None and _loaded_model_id == model_id:
+        return _loaded_pipeline
+
+    with _inference_lock:
+        # Double-check after acquiring the lock
+        if _loaded_pipeline is not None and _loaded_model_id == model_id:
+            return _loaded_pipeline
+
+        logger.info(f"Loading model for inference: {model_id}")
+        try:
+            import torch
+            from transformers import pipeline as hf_pipeline, AutoTokenizer
+
+            token = os.getenv("HF_TOKEN")
+            device = 0 if torch.cuda.is_available() else -1  # GPU if available, else CPU
+            dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+
+            pipe = hf_pipeline(
+                "text-generation",
+                model=model_id,
+                torch_dtype=dtype,
+                device=device,
+                token=token,
+                trust_remote_code=True,
+            )
+            _loaded_pipeline = pipe
+            _loaded_model_id = model_id
+            logger.info(f"Model {model_id} loaded successfully on device={device}")
+            return pipe
+        except Exception as e:
+            logger.error(f"Failed to load model {model_id}: {e}", exc_info=True)
+            raise
+
+from fastapi.middleware.cors import CORSMiddleware
+
 app = FastAPI(title="Lightning Tune API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 UPLOAD_DIR = Path("temp_uploads")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -33,6 +88,16 @@ def get_token(authorization: Optional[str] = Header(None)) -> Optional[str]:
             return authorization.split(" ")[1]
         return authorization
     return None
+
+@app.get("/status")
+def get_status():
+    """
+    Get status of all active training and serving jobs.
+    """
+    return {
+        "active_jobs": list(job_manager.active_jobs.keys()),
+        "total_jobs": len(job_manager.active_jobs)
+    }
 
 @app.get("/models", response_model=List[SearchResult])
 def find_models(query: str, limit: int = 20, token: Optional[str] = Depends(get_token)):
@@ -115,6 +180,36 @@ def start_train(request: TrainRequest, token: Optional[str] = Depends(get_token)
     Start a training job.
     """
     try:
+        c = request.config
+        if "model_name" in c and "model" not in c:
+            structured_config = {
+                "model": {
+                    "repo_id": c.get("model_name"),
+                    "quantization": c.get("quantization", "nf4")
+                },
+                "data": {
+                    "dataset_repo_id": c.get("dataset_name"),
+                    "instruction_column": c.get("dataset_config", {}).get("column_map", {}).get("instruction", "instruction"),
+                    "input_column": c.get("dataset_config", {}).get("column_map", {}).get("input", "input"),
+                    "output_column": c.get("dataset_config", {}).get("column_map", {}).get("output", "output")
+                },
+                "train": {
+                    "llm_lr": float(c.get("learning_rate", 2e-5)),
+                    "batch_size": int(c.get("batch_size", 2)),
+                    "peft": {
+                        "r": int(c.get("lora", {}).get("r", 16)),
+                        "lora_alpha": int(c.get("lora", {}).get("alpha", 32)),
+                        "lora_dropout": float(c.get("lora", {}).get("dropout", 0.05))
+                    }
+                },
+                "trainer": {
+                    "max_epochs": int(c.get("epochs", 1)),
+                    "logger": "mlflow",
+                    "mlflow_tracking_uri": os.getenv("MLFLOW_TRACKING_URI", "http://mlflow-server:5000")
+                }
+            }
+            request.config = structured_config
+
         job_id = job_manager.start_training_job(request.config, token)
         return JobResponse(job_id=job_id, status="running", output_dir=f"jobs/{job_id}")
     except Exception as e:
@@ -228,6 +323,77 @@ async def websocket_logs(websocket: WebSocket, job_id: str):
             await websocket.close()
         except:
             pass
+
+@app.get("/serving-status")
+def serving_status():
+    """
+    Report which model (if any) is currently loaded in-process.
+    """
+    return {
+        "loaded": _loaded_model_id is not None,
+        "model_id": _loaded_model_id,
+    }
+
+
+import asyncio
+import json as _json
+from pydantic import BaseModel as _BaseModel
+from fastapi.responses import StreamingResponse
+
+
+class PredictRequestBody(_BaseModel):
+    prompt: str
+    model_id: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    max_new_tokens: int = 512
+    temperature: float = 0.7
+
+
+@app.post("/predict")
+async def predict(body: PredictRequestBody, token: Optional[str] = Depends(get_token)):
+    """
+    Run local inference via a cached HuggingFace transformers pipeline.
+    Uses StreamingResponse so HTTP headers are sent immediately — this
+    prevents Node.js undici's 30-second headersTimeout from killing the
+    connection while the model is loading/running.
+    Returns a single JSON chunk: { completion: str }.
+    """
+    if token:
+        os.environ["HF_TOKEN"] = token
+
+    # Cap tokens to prevent multi-minute CPU inference hangs
+    max_tokens = min(body.max_new_tokens, 1024)
+
+    async def _stream():
+        loop = asyncio.get_event_loop()
+        try:
+            pipe = await loop.run_in_executor(
+                None, lambda: _get_or_load_pipeline(body.model_id)
+            )
+        except Exception as e:
+            yield _json.dumps({"error": f"Model could not be loaded: {e}"})
+            return
+
+        try:
+            results = await loop.run_in_executor(
+                None,
+                lambda: pipe(
+                    body.prompt,
+                    max_new_tokens=max_tokens,
+                    temperature=body.temperature,
+                    do_sample=body.temperature > 0,
+                    return_full_text=False,
+                ),
+            )
+            generated = results[0]["generated_text"] if results else ""
+            yield _json.dumps({"completion": generated})
+        except Exception as e:
+            logger.error(f"Inference failed: {e}", exc_info=True)
+            yield _json.dumps({"error": f"Inference failed: {e}"})
+
+    # StreamingResponse sends 200 + headers IMMEDIATELY, before any generator work starts.
+    # This satisfies undici headersTimeout (default 30s) on the Node.js side.
+    return StreamingResponse(_stream(), media_type="application/json")
+
 
 if __name__ == "__main__":
     import uvicorn

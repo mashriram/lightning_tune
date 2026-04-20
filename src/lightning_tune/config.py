@@ -118,7 +118,8 @@ class TrainerConfig(BaseModel):
     max_epochs: int = 3
     devices: int = 1
     device: str = Field(default_factory=get_auto_device)
-    logger: Literal["csv", "tensorboard"] = "tensorboard"
+    logger: Literal["csv", "tensorboard", "mlflow"] = "tensorboard"
+    mlflow_tracking_uri: Optional[str] = None
     checkpoint_callback: bool = True
     evaluation: EvaluationConfig = Field(default_factory=EvaluationConfig)
     limit_train_batches: Union[int, float] = 1.0
@@ -248,9 +249,9 @@ class PipelineConfig(BaseModel):
             raise ValueError(f"Unsupported file type: {file_suffix}")
         return df, df.head(100)
 
-    def _get_llm_hf_config(model_repo_id: str):
+    def _get_llm_hf_config(model_repo_id: str, token: Optional[str] = None):
         from transformers import AutoConfig
-        return AutoConfig.from_pretrained(model_repo_id, trust_remote_code=True)
+        return AutoConfig.from_pretrained(model_repo_id, trust_remote_code=True, token=token)
 
     @classmethod
     def from_yaml(cls, path: str) -> "PipelineConfig":
@@ -361,7 +362,7 @@ class PipelineConfig(BaseModel):
 
         hyperparams = cls._suggest_hyperparameters(total_size)
 
-        llm_hf_config = cls._get_llm_hf_config(model_repo_id)
+        llm_hf_config = cls._get_llm_hf_config(model_repo_id, token=token)
 
         data_cfg = DataConfig(
             datasets=dataset_configs,

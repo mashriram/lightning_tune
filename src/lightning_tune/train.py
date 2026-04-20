@@ -1,4 +1,4 @@
-import lightning as L, torch, math, warnings, logging
+import lightning as L, torch, math, warnings, logging, os
 from lightning.pytorch.loggers import TensorBoardLogger, CSVLogger
 from lightning.pytorch.callbacks import ModelCheckpoint
 from torch.utils.data import DataLoader
@@ -17,7 +17,7 @@ from transformers import (
 )
 from typing import Dict, Union, Any, Iterator, List, Optional
 from peft import LoraConfig, PeftModel
-from trl import SFTTrainer
+from trl import SFTTrainer, SFTConfig
 from pathlib import Path
 import copy
 from huggingface_hub import HfApi
@@ -69,8 +69,9 @@ def _run_text_finetuning_pipeline(config: PipelineConfig) -> Dict[str, Any]:
         use_dora=(config.train.peft.method == "dora"),
     )
 
-    training_args = TrainingArguments(
+    training_args = SFTConfig(
         output_dir=str(output_dir),
+        dataset_text_field="completion",
         num_train_epochs=config.trainer.max_epochs,
         per_device_train_batch_size=config.train.batch_size,
         gradient_accumulation_steps=1,
@@ -86,13 +87,20 @@ def _run_text_finetuning_pipeline(config: PipelineConfig) -> Dict[str, Any]:
             else "no"
         ),
         save_strategy="epoch",
-        load_best_model_at_end=config.trainer.evaluation.do_eval
-        and dataset.get("test"),
-        report_to="none",
+        load_best_model_at_end=bool(
+            config.trainer.evaluation.do_eval and dataset.get("test")
+        ),
+        report_to="mlflow" if config.trainer.logger == "mlflow" else "none",
         push_to_hub=config.train.push_to_hub,
         hub_model_id=config.train.hub_model_id,
-        hub_token=None # Will use env var HF_TOKEN
+        hub_token=None, # Will use env var HF_TOKEN
     )
+
+    if config.trainer.logger == "mlflow":
+        os.environ["MLFLOW_TRACKING_URI"] = config.trainer.mlflow_tracking_uri or os.getenv("MLFLOW_TRACKING_URI", "http://mlflow-server:5000")
+        os.environ["MLFLOW_EXPERIMENT_NAME"] = output_dir.name
+        # Optional: Set a readable run name
+        os.environ["MLFLOW_RUN_NAME"] = f"run_{output_dir.name}"
 
     trainer = SFTTrainer(
         model=model,
@@ -220,11 +228,14 @@ def _run_multimodal_pipeline(config: PipelineConfig) -> Dict[str, Any]:
 
     model = MultimodalLLM(config)
 
-    logger = (
-        TensorBoardLogger("logs", name=output_dir.name)
-        if config.trainer.logger == "tensorboard"
-        else CSVLogger("logs", name=output_dir.name)
-    )
+    if config.trainer.logger == "mlflow":
+        from lightning.pytorch.loggers import MLFlowLogger
+        tracking_uri = config.trainer.mlflow_tracking_uri or os.getenv("MLFLOW_TRACKING_URI", "http://mlflow-server:5000")
+        logger = MLFlowLogger(experiment_name=output_dir.name, tracking_uri=tracking_uri)
+    elif config.trainer.logger == "tensorboard":
+        logger = TensorBoardLogger("logs", name=output_dir.name)
+    else:
+        logger = CSVLogger("logs", name=output_dir.name)
 
     callbacks = []
     if config.trainer.checkpoint_callback:
