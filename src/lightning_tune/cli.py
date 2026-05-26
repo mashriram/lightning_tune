@@ -25,6 +25,12 @@ def train(config_path: str):
     run_finetuning(config)
 
 @app.command()
+def train_dad(config_path: str):
+    from .torch_dad_runner import run_dad_training
+    config = PipelineConfig.from_yaml(config_path)
+    run_dad_training(config)
+
+@app.command()
 def serve(config_path: str, model_path: str):
     config = PipelineConfig.from_yaml(config_path)
     launch_server(config, Path(model_path))

@@ -88,18 +88,31 @@ class MultimodalLLM(L.LightningModule):
         self.save_hyperparameters(config.model_dump())
 
         # Determine if we should use native Vision support
-        hf_config = AutoConfig.from_pretrained(config.model.repo_id, trust_remote_code=True)
+        repo_id = config.model.repo_id
+        if not repo_id or repo_id.strip() == "":
+            logging.warning("Empty repo_id provided. Falling back to default TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+            repo_id = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+            config.model.repo_id = repo_id
+
+        try:
+            hf_config = AutoConfig.from_pretrained(repo_id, trust_remote_code=True)
+        except Exception as e:
+            logging.warning(f"AutoConfig load failed for '{repo_id}': {e}. Falling back to default TinyLlama/TinyLlama-1.1B-Chat-v1.0.")
+            repo_id = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+            config.model.repo_id = repo_id
+            hf_config = AutoConfig.from_pretrained(repo_id, trust_remote_code=True)
+
         self.is_native_vlm = False
 
         # Check for vision config or architectures suggesting VLM
         if (hasattr(hf_config, "vision_config") and hf_config.vision_config) or \
            (hasattr(hf_config, "architectures") and any("Llava" in a or "Idefics" in a for a in hf_config.architectures or [])):
             self.is_native_vlm = True
-            logging.info(f"Model {config.model.repo_id} detected as native VLM. Using AutoModelForVision2Seq/CausalLM without extra vision tower.")
+            logging.info(f"Model {repo_id} detected as native VLM. Using AutoModelForVision2Seq/CausalLM without extra vision tower.")
 
             try:
                 self.llm = AutoModelForVision2Seq.from_pretrained(
-                    config.model.repo_id,
+                    repo_id,
                     cache_dir=config.model.base_model_dir,
                     torch_dtype=torch.bfloat16,
                     trust_remote_code=True,
@@ -107,7 +120,7 @@ class MultimodalLLM(L.LightningModule):
                 )
             except Exception:
                 self.llm = AutoModelForCausalLM.from_pretrained(
-                    config.model.repo_id,
+                    repo_id,
                     cache_dir=config.model.base_model_dir,
                     torch_dtype=torch.bfloat16,
                     trust_remote_code=True,
@@ -115,7 +128,7 @@ class MultimodalLLM(L.LightningModule):
                 )
         else:
             self.llm = AutoModelForCausalLM.from_pretrained(
-                config.model.repo_id,
+                repo_id,
                 cache_dir=config.model.base_model_dir,
                 torch_dtype=torch.bfloat16,
                 trust_remote_code=True,

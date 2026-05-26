@@ -45,3 +45,8 @@ class PushRequest(BaseModel):
     job_id: str
     hub_model_id: str
     private: bool = False
+
+class QuantizeRequest(BaseModel):
+    model_name_or_path: str
+    output_path: str
+    format: str = "gguf"

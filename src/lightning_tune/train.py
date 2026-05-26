@@ -17,21 +17,70 @@ from transformers import (
 )
 from typing import Dict, Union, Any, Iterator, List, Optional
 from peft import LoraConfig, PeftModel
-from trl import SFTTrainer, SFTConfig
+from trl import SFTTrainer, SFTConfig, DPOTrainer, DPOConfig, GRPOTrainer, GRPOConfig
+from transformers import TrainerCallback
 from pathlib import Path
 import copy
 from huggingface_hub import HfApi
+from .utils import log_job_metrics
+
+class SQLiteLoggingCallback(TrainerCallback):
+    def __init__(self, job_id: str):
+        self.job_id = job_id
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs:
+            loss = logs.get("loss") or logs.get("train_loss") or 0.0
+            reward = logs.get("reward") or logs.get("rewards/chosen") or logs.get("rewards/mean") or logs.get("mean_reward")
+            step = state.global_step
+            epoch = state.epoch or 0.0
+            
+            # Extract any other scalar metrics
+            extra = {k: v for k, v in logs.items() if isinstance(v, (int, float))}
+            
+            log_job_metrics(
+                job_id=self.job_id,
+                step=step,
+                epoch=epoch,
+                loss=loss,
+                reward=reward,
+                extra_metrics=extra
+            )
+
+# --- Verifiable Reward Functions for RLVR and GRPO ---
+
+def format_reward_func(prompts, completions, **kwargs) -> list[float]:
+    """Verify that the model outputs structured reasoning in XML format."""
+    rewards = []
+    for completion in completions:
+        has_reasoning = "<reasoning>" in completion and "</reasoning>" in completion
+        has_answer = "<answer>" in completion and "</answer>" in completion
+        rewards.append(1.0 if (has_reasoning and has_answer) else 0.0)
+    return rewards
+
+def accuracy_reward_func(prompts, completions, ground_truth, **kwargs) -> list[float]:
+    """Verify that the output contains the correct ground-truth target."""
+    rewards = []
+    for completion, gt in zip(completions, ground_truth):
+        clean_completion = completion.strip().lower()
+        if gt.strip().lower() in clean_completion:
+            rewards.append(1.5)
+        else:
+            rewards.append(0.0)
+    return rewards
 
 
 def _run_text_finetuning_pipeline(config: PipelineConfig) -> Dict[str, Any]:
-    if config.train.peft.method == "qlora" and config.trainer.device != "cuda":
+    method = config.train.peft.method
+    if method == "qlora" and config.trainer.device != "cuda":
         warnings.warn(
             "QLoRA is only available on CUDA devices. Falling back to LoRA."
         )
         config.train.peft.method = "lora"
+        method = "lora"
 
     logging.info(
-        f"--- Starting Text-Only Finetuning with {config.train.peft.method.upper()} ---"
+        f"--- Starting Text-Only Preference/Fine-tuning with {method.upper()} ---"
     )
     output_dir = config.get_output_dir()
     dataset = prepare_text_dataset(config)
@@ -42,7 +91,7 @@ def _run_text_finetuning_pipeline(config: PipelineConfig) -> Dict[str, Any]:
             bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=torch.bfloat16,
         )
-        if config.train.peft.method == "qlora"
+        if method == "qlora"
         else None
     )
 
@@ -66,56 +115,108 @@ def _run_text_finetuning_pipeline(config: PipelineConfig) -> Dict[str, Any]:
         lora_dropout=config.train.peft.lora_dropout,
         bias="none",
         task_type="CAUSAL_LM",
-        use_dora=(config.train.peft.method == "dora"),
+        use_dora=(method == "dora"),
     )
 
-    training_args = SFTConfig(
-        output_dir=str(output_dir),
-        dataset_text_field="completion",
-        num_train_epochs=config.trainer.max_epochs,
-        per_device_train_batch_size=config.train.batch_size,
-        gradient_accumulation_steps=1,
-        optim="paged_adamw_32bit" if config.trainer.device == "cuda" else "adamw_torch",
-        learning_rate=config.train.llm_lr,
-        bf16=(config.trainer.device == "cuda"),
-        fp16=False,
-        logging_steps=10,
-        do_eval=config.trainer.evaluation.do_eval,
-        eval_strategy=(
-            "epoch"
-            if config.trainer.evaluation.do_eval and dataset.get("test")
-            else "no"
-        ),
-        save_strategy="epoch",
-        load_best_model_at_end=bool(
-            config.trainer.evaluation.do_eval and dataset.get("test")
-        ),
-        report_to="mlflow" if config.trainer.logger == "mlflow" else "none",
-        push_to_hub=config.train.push_to_hub,
-        hub_model_id=config.train.hub_model_id,
-        hub_token=None, # Will use env var HF_TOKEN
-    )
-
+    # Configure Logging / MLflow environment
     if config.trainer.logger == "mlflow":
         os.environ["MLFLOW_TRACKING_URI"] = config.trainer.mlflow_tracking_uri or os.getenv("MLFLOW_TRACKING_URI", "http://mlflow-server:5000")
         os.environ["MLFLOW_EXPERIMENT_NAME"] = output_dir.name
-        # Optional: Set a readable run name
         os.environ["MLFLOW_RUN_NAME"] = f"run_{output_dir.name}"
 
-    trainer = SFTTrainer(
-        model=model,
-        train_dataset=dataset["train"],
-        eval_dataset=dataset.get("test"),
-        peft_config=peft_config,
-        args=training_args,
-    )
+    sqlite_callback = SQLiteLoggingCallback(output_dir.name)
 
-    logging.info("Starting SFTTrainer training...")
+    if method == "dpo":
+        logging.info("Initializing TRL DPOTrainer...")
+        training_args = DPOConfig(
+            output_dir=str(output_dir),
+            num_train_epochs=config.trainer.max_epochs,
+            per_device_train_batch_size=config.train.batch_size,
+            gradient_accumulation_steps=1,
+            optim="paged_adamw_32bit" if config.trainer.device == "cuda" else "adamw_torch",
+            learning_rate=config.train.llm_lr,
+            bf16=(config.trainer.device == "cuda"),
+            fp16=False,
+            logging_steps=5,
+            do_eval=config.trainer.evaluation.do_eval,
+            eval_strategy="epoch" if config.trainer.evaluation.do_eval and dataset.get("test") else "no",
+            save_strategy="epoch",
+            report_to="mlflow" if config.trainer.logger == "mlflow" else "none",
+        )
+        trainer = DPOTrainer(
+            model=model,
+            ref_model=None,
+            peft_config=peft_config,
+            args=training_args,
+            train_dataset=dataset["train"],
+            eval_dataset=dataset.get("test"),
+            processing_class=tokenizer,
+            callbacks=[sqlite_callback],
+        )
+
+    elif method in ["grpo", "rlvr"]:
+        logging.info("Initializing TRL GRPOTrainer for Verifiable Reward Policy Optimization...")
+        training_args = GRPOConfig(
+            output_dir=str(output_dir),
+            num_train_epochs=config.trainer.max_epochs,
+            per_device_train_batch_size=config.train.batch_size,
+            gradient_accumulation_steps=1,
+            learning_rate=config.train.llm_lr,
+            bf16=(config.trainer.device == "cuda"),
+            fp16=False,
+            logging_steps=5,
+            report_to="mlflow" if config.trainer.logger == "mlflow" else "none",
+        )
+        trainer = GRPOTrainer(
+            model=model,
+            reward_funcs=[format_reward_func, accuracy_reward_func],
+            peft_config=peft_config,
+            args=training_args,
+            train_dataset=dataset["train"],
+            eval_dataset=dataset.get("test"),
+            processing_class=tokenizer,
+            callbacks=[sqlite_callback],
+        )
+
+    else:
+        # Standard SFT
+        logging.info("Initializing TRL SFTTrainer...")
+        training_args = SFTConfig(
+            output_dir=str(output_dir),
+            dataset_text_field="completion",
+            num_train_epochs=config.trainer.max_epochs,
+            per_device_train_batch_size=config.train.batch_size,
+            gradient_accumulation_steps=1,
+            optim="paged_adamw_32bit" if config.trainer.device == "cuda" else "adamw_torch",
+            learning_rate=config.train.llm_lr,
+            bf16=(config.trainer.device == "cuda"),
+            fp16=False,
+            logging_steps=5,
+            do_eval=config.trainer.evaluation.do_eval,
+            eval_strategy="epoch" if config.trainer.evaluation.do_eval and dataset.get("test") else "no",
+            save_strategy="epoch",
+            load_best_model_at_end=bool(config.trainer.evaluation.do_eval and dataset.get("test")),
+            report_to="mlflow" if config.trainer.logger == "mlflow" else "none",
+            push_to_hub=config.train.push_to_hub,
+            hub_model_id=config.train.hub_model_id,
+        )
+        trainer = SFTTrainer(
+            model=model,
+            train_dataset=dataset["train"],
+            eval_dataset=dataset.get("test"),
+            peft_config=peft_config,
+            args=training_args,
+            callbacks=[sqlite_callback],
+        )
+
+    logging.info("Starting trainer training...")
     trainer.train()
-    if config.trainer.evaluation.do_eval and dataset.get("test"):
+    
+    if config.trainer.evaluation.do_eval and dataset.get("test") and method not in ["grpo", "rlvr"]:
         logging.info("Evaluating final model...")
         metrics = trainer.evaluate()
-        logging.info(f"Evaluation results: Perplexity: {math.exp(metrics['eval_loss']):.2f}")
+        if 'eval_loss' in metrics:
+            logging.info(f"Evaluation results: Perplexity: {math.exp(metrics['eval_loss']):.2f}")
 
     final_adapter_path = output_dir / "final_adapter"
     trainer.save_model(str(final_adapter_path))
@@ -124,7 +225,7 @@ def _run_text_finetuning_pipeline(config: PipelineConfig) -> Dict[str, Any]:
          trainer.push_to_hub()
          logging.info(f"Pushed to hub: {config.train.hub_model_id}")
 
-    logging.info(f"--- Finetuning Complete. Adapter saved to: {final_adapter_path} ---")
+    logging.info(f"--- Preference/Finetuning Complete. Adapter saved to: {final_adapter_path} ---")
     return {"path": final_adapter_path, "metrics": metrics if 'metrics' in locals() else {}}
 
 

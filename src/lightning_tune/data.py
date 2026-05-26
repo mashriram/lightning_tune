@@ -15,12 +15,15 @@ import torchaudio
 from torchaudio.transforms import Resample
 
 def prepare_text_dataset(config: PipelineConfig) -> DatasetDict:
+    method = config.train.peft.method
+    
     def format_prompt_for_dataset(ds_config, global_config):
-        # Create a closure mapping tied to individual dataset configurations
-        # Fall back to global configuration if the local dataset config lacks necessary definitions.
         input_col = getattr(ds_config, "input_column", None) or getattr(global_config, "input_column", None)
         instr_col = getattr(ds_config, "instruction_column", None) or getattr(global_config, "instruction_column", None)
         out_col = getattr(ds_config, "output_column", None) or getattr(global_config, "output_column", None)
+        
+        # Additional fields for DPO/RLVR
+        rejected_col = getattr(ds_config, "rejected_column", None) or getattr(global_config, "rejected_column", None) or "rejected"
 
         def _format(example):
             i_txt = str(example.get(instr_col, '')) if instr_col in example else ''
@@ -28,11 +31,26 @@ def prepare_text_dataset(config: PipelineConfig) -> DatasetDict:
             o_txt = str(example.get(out_col, '')) if out_col in example else ''
             
             prompt = f"### Instruction:\n{i_txt}\n\n### Input:\n{in_txt}\n\n### Response:\n" if in_txt else f"### Instruction:\n{i_txt}\n\n### Response:\n"
-            full_text = prompt + o_txt
             
             res = dict(example)
-            res["completion"] = full_text
-            res["instruction_prompt"] = prompt # Useful for evaluation
+            
+            if method == "dpo":
+                # Ensure we have chosen and rejected
+                chosen_ans = o_txt if o_txt else str(example.get("chosen", ""))
+                rejected_ans = str(example.get(rejected_col, "")) if rejected_col in example else str(example.get("rejected", ""))
+                res["prompt"] = prompt
+                res["chosen"] = chosen_ans
+                res["rejected"] = rejected_ans
+            elif method in ["grpo", "rlvr"]:
+                # Ensure we have prompt and ground_truth
+                res["prompt"] = prompt
+                res["ground_truth"] = o_txt if o_txt else str(example.get("ground_truth", ""))
+            else:
+                # SFT (standard text completion)
+                full_text = prompt + o_txt
+                res["completion"] = full_text
+                res["instruction_prompt"] = prompt
+                
             return res
         return _format
 
@@ -40,7 +58,6 @@ def prepare_text_dataset(config: PipelineConfig) -> DatasetDict:
     
     # Process multiple datasets
     sources = config.data.datasets if config.data.datasets else []
-    # legacy fallback handled during config consolidation, but just in case
     all_items = []
              
     for src in sources:
@@ -65,7 +82,7 @@ def prepare_text_dataset(config: PipelineConfig) -> DatasetDict:
              all_items.extend([formatter(x) for x in ds])
 
     if not all_items:
-        raise ValueError("No datasets could be loaded for text finetuning.")
+        raise ValueError("No datasets could be loaded for preference/text finetuning.")
 
     from datasets import Dataset as HFDataset
     dataset = HFDataset.from_list(all_items)

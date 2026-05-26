@@ -12,3 +12,4 @@ wheels/
 models/
 finetuning_runs/
 logs/
+.env

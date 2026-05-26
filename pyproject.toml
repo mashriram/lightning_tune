@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 readme = "README.md"
 requires-python = ">=3.12"
 name = "lightning_tune"
-version = "2026.2"
+version = "2026.5.1"
 description = "A production-ready library for automated, advanced multi-modal LLM finetuning and deployment."
 authors = [
     {name = "Jules", email = "jules@example.com"},
@@ -54,6 +54,14 @@ dependencies = [
     "torch>=2.10.0",
     "twine>=6.2.0",
     "build>=1.4.0",
+    "sentence-transformers>=5.5.1",
+    "langchain-google-genai>=4.2.3",
+    "langchain-openai>=1.2.2",
+    "langchain-groq>=1.1.2",
+    "python-docx>=1.2.0",
+    "pypdf>=6.12.1",
+    "langchain-chroma>=1.1.0",
+    "langchain-huggingface>=1.2.2",
 ]
 
 [project.optional-dependencies]
@@ -62,3 +70,6 @@ build = ["build"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.uv.sources]
+transformers = { git = "https://github.com/huggingface/transformers.git" }

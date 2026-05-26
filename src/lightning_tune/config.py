@@ -12,7 +12,7 @@ class ModelConfig(BaseModel):
 
 
 class PeftConfig(BaseModel):
-    method: Literal["qlora", "lora", "dora"] = "qlora"
+    method: Literal["qlora", "lora", "dora", "dpo", "grpo", "rlvr"] = "qlora"
     r: int = 8
     lora_alpha: int = 32
     lora_dropout: float = 0.05
@@ -139,6 +139,7 @@ class TrainConfig(BaseModel):
 class DeploymentConfig(BaseModel):
     port: int = 8000
     use_vllm: bool = True
+    serving_engine: Literal["LitServe (Local)", "vLLM", "llama.cpp"] = "LitServe (Local)"
 
 
 class PipelineConfig(BaseModel):

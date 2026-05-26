@@ -15,7 +15,7 @@ import logging
 import threading
 
 # Use absolute imports
-from app.api.schemas import SearchResult, DatasetSearchResult, AnalyzeRequest, TrainRequest, JobResponse, ServeRequest, PushRequest
+from app.api.schemas import SearchResult, DatasetSearchResult, AnalyzeRequest, TrainRequest, JobResponse, ServeRequest, PushRequest, QuantizeRequest
 from app.api.job_manager import job_manager
 from src.lightning_tune.hf_utils import search_models, search_datasets
 from src.lightning_tune.config import PipelineConfig
@@ -34,6 +34,11 @@ _loaded_model_id = None   # which model is currently loaded
 def _get_or_load_pipeline(model_id: str):
     """Load (or return cached) a transformers text-generation pipeline."""
     global _loaded_pipeline, _loaded_model_id
+    
+    # 1. Handle empty / blank string
+    if not model_id or model_id.strip() == "":
+        model_id = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+        
     if _loaded_pipeline is not None and _loaded_model_id == model_id:
         return _loaded_pipeline
 
@@ -45,9 +50,17 @@ def _get_or_load_pipeline(model_id: str):
         logger.info(f"Loading model for inference: {model_id}")
         try:
             import torch
-            from transformers import pipeline as hf_pipeline, AutoTokenizer
+            from transformers import pipeline as hf_pipeline, AutoTokenizer, AutoConfig
 
             token = os.getenv("HF_TOKEN")
+            
+            # Double-check configuration compatibility & apply fallback
+            try:
+                AutoConfig.from_pretrained(model_id, trust_remote_code=True, token=token)
+            except Exception as e:
+                logger.warning(f"Config load failed for {model_id}: {e}. Mapping to default TinyLlama/TinyLlama-1.1B-Chat-v1.0.")
+                model_id = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+
             device = 0 if torch.cuda.is_available() else -1  # GPU if available, else CPU
             dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 
@@ -307,6 +320,47 @@ def push_to_hub(request: PushRequest, token: Optional[str] = Depends(get_token))
         logger.error(f"Push to hub failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/quantize")
+def quantize_model_endpoint(request: QuantizeRequest):
+    """
+    Quantize safetensors to GGUF, AWQ, or GPTQ format.
+    """
+    try:
+        from src.lightning_tune.deploy import quantize_model
+        res = quantize_model(
+            model_name_or_path=request.model_name_or_path,
+            output_path=request.output_path,
+            format=request.format
+        )
+        return res
+    except Exception as e:
+        logger.error(f"Quantization failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/jobs/{job_id}/logs")
+def get_job_logs(job_id: str):
+    """
+    Get the complete logs for a training or serving job.
+    """
+    from pathlib import Path
+    
+    # Try finding logs in the job folder
+    job_dir = Path("jobs") / job_id
+    if not job_dir.exists():
+        raise HTTPException(status_code=404, detail="Job directory not found")
+        
+    log_files = ["train.log", "tune.log", "serve.log"]
+    for log_name in log_files:
+        log_path = job_dir / log_name
+        if log_path.exists():
+            try:
+                with open(log_path, "r") as f:
+                    return {"job_id": job_id, "log_type": log_name, "content": f.read()}
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Failed to read log: {e}")
+                
+    raise HTTPException(status_code=404, detail="No log files found in job directory")
+
 @app.websocket("/train/{job_id}/logs")
 async def websocket_logs(websocket: WebSocket, job_id: str):
     """
@@ -327,11 +381,52 @@ async def websocket_logs(websocket: WebSocket, job_id: str):
 @app.get("/serving-status")
 def serving_status():
     """
-    Report which model (if any) is currently loaded in-process.
+    Report which model (if any) is currently loaded (either in-process or via detached server subprocesses).
     """
+    # 1. Check active background serving processes first (like LitServe, vLLM, llama.cpp)
+    import yaml
+    from pathlib import Path
+    for job_id, process in list(job_manager.active_jobs.items()):
+        if job_id.startswith("service_") and process.poll() is None:
+            # Found an active serving process!
+            # Let's read its config inside jobs/<job_id>
+            service_dir = Path("jobs") / job_id
+            config_path = service_dir / "serve_config.yaml"
+            if config_path.exists():
+                try:
+                    with open(config_path, "r") as f:
+                        cfg = yaml.safe_load(f)
+                    
+                    repo_id = cfg.get("model", {}).get("repo_id")
+                    port = cfg.get("deployment", {}).get("port", 8000)
+                    engine = cfg.get("serving_engine", "litserve")
+                    
+                    return {
+                        "loaded": True,
+                        "model_id": repo_id,
+                        "port": port,
+                        "engine": engine,
+                        "url": f"http://localhost:{port}"
+                    }
+                except Exception as e:
+                    logger.warning(f"Failed to read serve config for {job_id}: {e}")
+
+    # 2. Check in-process inference model fallback
+    if _loaded_model_id is not None:
+        return {
+            "loaded": True,
+            "model_id": _loaded_model_id,
+            "port": 8000,
+            "engine": "in-process",
+            "url": "http://localhost:8000"
+        }
+                    
     return {
-        "loaded": _loaded_model_id is not None,
-        "model_id": _loaded_model_id,
+        "loaded": False,
+        "model_id": None,
+        "port": None,
+        "engine": None,
+        "url": None
     }
 
 
